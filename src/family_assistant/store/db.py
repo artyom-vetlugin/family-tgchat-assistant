@@ -1,0 +1,425 @@
+"""SQLite store: raw archive (Layer 1) + FTS5 search index.
+
+Traffic in a 4-person family chat is tiny, so synchronous sqlite3 calls from
+the event loop are fine (sub-millisecond inserts in WAL mode).
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+SCHEMA_PATH = Path(__file__).with_name("schema.sql")
+
+
+@dataclass
+class MessageRow:
+    id: int
+    tg_message_id: int
+    tg_chat_id: int
+    sender: str | None
+    ts: int
+    reply_to: int | None
+    kind: str
+    text: str | None
+
+    @property
+    def when(self) -> str:
+        return datetime.fromtimestamp(self.ts, tz=timezone.utc).astimezone().strftime(
+            "%Y-%m-%d %H:%M"
+        )
+
+    def format(self) -> str:
+        if self.text:
+            prefix = f"[голосовое] " if self.kind in ("voice", "video_note") else ""
+            body = prefix + self.text
+        else:
+            body = f"[{self.kind} без текста]"
+        return f"[{self.when}] {self.sender or '?'} (msg {self.tg_message_id}): {body}"
+
+
+class Store:
+    def __init__(self, db_path: Path):
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(db_path)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        self.conn.commit()
+
+    def close(self) -> None:
+        self.conn.close()
+
+    # --- senders -----------------------------------------------------------
+
+    def upsert_sender(self, tg_user_id: int, display_name: str) -> int:
+        cur = self.conn.execute(
+            """
+            INSERT INTO senders (tg_user_id, display_name) VALUES (?, ?)
+            ON CONFLICT(tg_user_id) DO UPDATE SET display_name = excluded.display_name
+            RETURNING id
+            """,
+            (tg_user_id, display_name),
+        )
+        sender_id = cur.fetchone()[0]
+        self.conn.commit()
+        return sender_id
+
+    def upsert_export_sender(
+        self, tg_user_id: int | None, name: str | None
+    ) -> int | None:
+        """Resolve an export sender without clobbering the live display_name.
+
+        The bot's `upsert_sender` overwrites display_name (live names are
+        authoritative); export name variants are accumulated in `aliases`.
+        """
+        if tg_user_id is None:
+            return None
+        row = self.conn.execute(
+            "SELECT id, display_name, aliases FROM senders WHERE tg_user_id = ?",
+            (tg_user_id,),
+        ).fetchone()
+        if row is None:
+            cur = self.conn.execute(
+                "INSERT INTO senders (tg_user_id, display_name, aliases) VALUES (?, ?, ?)",
+                (tg_user_id, name, json.dumps([])),
+            )
+            self.conn.commit()
+            return cur.lastrowid
+        if name and name != row["display_name"]:
+            aliases = parse_aliases(row["aliases"])
+            if name not in aliases:
+                aliases.append(name)
+                self.conn.execute(
+                    "UPDATE senders SET aliases = ? WHERE id = ?",
+                    (json.dumps(aliases, ensure_ascii=False), row["id"]),
+                )
+                self.conn.commit()
+        return row["id"]
+
+    # --- messages ----------------------------------------------------------
+
+    def insert_message(
+        self,
+        *,
+        tg_message_id: int,
+        tg_chat_id: int,
+        sender_id: int | None,
+        ts: int,
+        kind: str,
+        text: str | None,
+        reply_to: int | None = None,
+        source: str = "live",
+    ) -> int | None:
+        """Insert a message; returns row id, or None if it was a duplicate."""
+        cur = self.conn.execute(
+            """
+            INSERT OR IGNORE INTO messages
+              (tg_message_id, tg_chat_id, sender_id, ts, reply_to, kind, text, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (tg_message_id, tg_chat_id, sender_id, ts, reply_to, kind, text, source),
+        )
+        self.conn.commit()
+        return cur.lastrowid if cur.rowcount else None
+
+    def live_message_id(self, tg_chat_id: int, tg_message_id: int) -> int | None:
+        """Row id of the live-source row for this telegram message, if any."""
+        row = self.conn.execute(
+            "SELECT id FROM messages "
+            "WHERE tg_chat_id = ? AND tg_message_id = ? AND source = 'live'",
+            (tg_chat_id, tg_message_id),
+        ).fetchone()
+        return row["id"] if row else None
+
+    def export_message_id(self, tg_chat_id: int, tg_message_id: int) -> int | None:
+        """Row id of the export-source row for this telegram message, if any."""
+        row = self.conn.execute(
+            "SELECT id FROM messages "
+            "WHERE tg_chat_id = ? AND tg_message_id = ? AND source = 'export'",
+            (tg_chat_id, tg_message_id),
+        ).fetchone()
+        return row["id"] if row else None
+
+    def live_messages_at(self, tg_chat_id: int, ts: int) -> list[tuple[int, str | None]]:
+        """(id, text) of live rows at an exact timestamp — for fallback dedup."""
+        rows = self.conn.execute(
+            "SELECT id, text FROM messages "
+            "WHERE tg_chat_id = ? AND ts = ? AND source = 'live'",
+            (tg_chat_id, ts),
+        ).fetchall()
+        return [(r["id"], r["text"]) for r in rows]
+
+    def index_text(self, message_id: int, body: str) -> None:
+        """Add searchable text (message text, transcript, or caption) to FTS."""
+        row = self.conn.execute(
+            """
+            SELECT m.ts, s.display_name AS sender
+            FROM messages m LEFT JOIN senders s ON s.id = m.sender_id
+            WHERE m.id = ?
+            """,
+            (message_id,),
+        ).fetchone()
+        if row is None:
+            return
+        self.conn.execute(
+            "INSERT INTO search (body, message_id, ts, sender) VALUES (?, ?, ?, ?)",
+            (body, message_id, row["ts"], row["sender"]),
+        )
+        self.conn.commit()
+
+    # --- media / transcripts / jobs (M2+) ------------------------------------
+
+    def insert_media(
+        self,
+        *,
+        message_id: int,
+        kind: str,
+        rel_path: str | None,
+        mime: str | None = None,
+        bytes: int | None = None,
+        skipped: bool = False,
+        sha256: str | None = None,
+    ) -> int:
+        cur = self.conn.execute(
+            """
+            INSERT INTO media (message_id, kind, rel_path, mime, bytes, skipped, sha256)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (message_id, kind, rel_path, mime, bytes, int(skipped), sha256),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def has_media(self, message_id: int) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM media WHERE message_id = ? LIMIT 1", (message_id,)
+        ).fetchone()
+        return row is not None
+
+    def upgrade_media(
+        self,
+        message_id: int,
+        *,
+        rel_path: str,
+        mime: str | None = None,
+        bytes: int | None = None,
+        sha256: str | None = None,
+    ) -> None:
+        """Replace a placeholder media row (rel_path NULL / skipped) with the
+        real file — e.g. a fuller export now includes a previously missing file."""
+        self.conn.execute(
+            "UPDATE media SET rel_path = ?, mime = ?, bytes = ?, skipped = 0, sha256 = ? "
+            "WHERE message_id = ?",
+            (rel_path, mime, bytes, sha256, message_id),
+        )
+        self.conn.commit()
+
+    def media_for_message(self, message_id: int) -> tuple[str | None, bool] | None:
+        """Returns (rel_path, skipped) for the message's media, or None."""
+        row = self.conn.execute(
+            "SELECT rel_path, skipped FROM media WHERE message_id = ? LIMIT 1",
+            (message_id,),
+        ).fetchone()
+        return (row["rel_path"], bool(row["skipped"])) if row else None
+
+    def insert_transcript(
+        self, *, message_id: int, text: str, engine: str, lang: str = "ru"
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO transcripts (message_id, text, engine, lang, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (message_id, text, engine, lang, int(time.time())),
+        )
+        self.conn.commit()
+
+    def create_job(self, *, job_type: str, ref_id: int) -> int:
+        cur = self.conn.execute(
+            "INSERT OR IGNORE INTO jobs (job_type, ref_id, updated_at) VALUES (?, ?, ?)",
+            (job_type, ref_id, int(time.time())),
+        )
+        self.conn.commit()
+        if cur.rowcount:
+            return cur.lastrowid
+        # Job already existed (UNIQUE(job_type, ref_id)) — return the existing id.
+        row = self.conn.execute(
+            "SELECT id FROM jobs WHERE job_type = ? AND ref_id = ?",
+            (job_type, ref_id),
+        ).fetchone()
+        return row["id"]
+
+    def job_ref(self, job_id: int) -> tuple[str, int] | None:
+        row = self.conn.execute(
+            "SELECT job_type, ref_id FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        return (row["job_type"], row["ref_id"]) if row else None
+
+    def claim_job(self, job_id: int) -> int:
+        """Mark the job inflight; returns the new attempts count."""
+        cur = self.conn.execute(
+            """
+            UPDATE jobs SET state = 'inflight', attempts = attempts + 1, updated_at = ?
+            WHERE id = ? RETURNING attempts
+            """,
+            (int(time.time()), job_id),
+        )
+        attempts = cur.fetchone()[0]
+        self.conn.commit()
+        return attempts
+
+    def finish_job(self, job_id: int, *, ok: bool, max_attempts: int) -> str:
+        """Finalize a job attempt; returns the resulting state
+        ('done', 'pending' for retry, or 'error' when attempts exhausted)."""
+        if ok:
+            state = "done"
+        else:
+            row = self.conn.execute(
+                "SELECT attempts FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            state = "error" if row and row["attempts"] >= max_attempts else "pending"
+        self.conn.execute(
+            "UPDATE jobs SET state = ?, updated_at = ? WHERE id = ?",
+            (state, int(time.time()), job_id),
+        )
+        self.conn.commit()
+        return state
+
+    def pending_jobs(self, job_type: str) -> list[int]:
+        rows = self.conn.execute(
+            "SELECT id FROM jobs WHERE job_type = ? AND state = 'pending' ORDER BY id",
+            (job_type,),
+        ).fetchall()
+        return [r["id"] for r in rows]
+
+    def reset_stale_jobs(self, job_type: str) -> int:
+        """Recover jobs left 'inflight' by a previous run (crash/restart)."""
+        cur = self.conn.execute(
+            "UPDATE jobs SET state = 'pending', updated_at = ? "
+            "WHERE job_type = ? AND state = 'inflight'",
+            (int(time.time()), job_type),
+        )
+        self.conn.commit()
+        return cur.rowcount
+
+    # --- retrieval (query-engine tools) -------------------------------------
+
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 10,
+        sender: str | None = None,
+        after_ts: int | None = None,
+        before_ts: int | None = None,
+    ) -> list[MessageRow]:
+        # Quote the query so user text can't break FTS5 syntax; trigram tokenizer
+        # then does substring matching on the quoted string.
+        fts_query = '"' + query.replace('"', '""') + '"'
+        sql = """
+            SELECT m.id, m.tg_message_id, m.tg_chat_id, se.display_name AS sender,
+                   m.ts, m.reply_to, m.kind,
+                   COALESCE(m.text, tr.text) AS text
+            FROM search s
+            JOIN messages m ON m.id = s.message_id
+            LEFT JOIN senders se ON se.id = m.sender_id
+            LEFT JOIN transcripts tr ON tr.message_id = m.id
+            WHERE search MATCH ?
+        """
+        params: list = [fts_query]
+        if sender:
+            sql += " AND se.display_name LIKE ?"
+            params.append(f"%{sender}%")
+        if after_ts:
+            sql += " AND m.ts >= ?"
+            params.append(after_ts)
+        if before_ts:
+            sql += " AND m.ts <= ?"
+            params.append(before_ts)
+        sql += " ORDER BY rank LIMIT ?"
+        params.append(limit)
+        try:
+            rows = self.conn.execute(sql, params).fetchall()
+        except sqlite3.OperationalError:
+            return []  # malformed query (e.g. <3 chars for trigram)
+        return [self._to_message_row(r) for r in rows]
+
+    def get_messages_around(
+        self, tg_chat_id: int, tg_message_id: int, n: int = 5
+    ) -> list[MessageRow]:
+        anchor = self.conn.execute(
+            "SELECT ts FROM messages WHERE tg_chat_id = ? AND tg_message_id = ? LIMIT 1",
+            (tg_chat_id, tg_message_id),
+        ).fetchone()
+        if anchor is None:
+            return []
+        rows = self.conn.execute(
+            """
+            SELECT * FROM (
+              SELECT m.id, m.tg_message_id, m.tg_chat_id, se.display_name AS sender,
+                     m.ts, m.reply_to, m.kind, COALESCE(m.text, tr.text) AS text
+              FROM messages m LEFT JOIN senders se ON se.id = m.sender_id
+              LEFT JOIN transcripts tr ON tr.message_id = m.id
+              WHERE m.tg_chat_id = ? AND m.ts <= ? ORDER BY m.ts DESC LIMIT ?
+            )
+            UNION
+            SELECT * FROM (
+              SELECT m.id, m.tg_message_id, m.tg_chat_id, se.display_name AS sender,
+                     m.ts, m.reply_to, m.kind, COALESCE(m.text, tr.text) AS text
+              FROM messages m LEFT JOIN senders se ON se.id = m.sender_id
+              LEFT JOIN transcripts tr ON tr.message_id = m.id
+              WHERE m.tg_chat_id = ? AND m.ts > ? ORDER BY m.ts ASC LIMIT ?
+            )
+            ORDER BY ts
+            """,
+            (tg_chat_id, anchor["ts"], n + 1, tg_chat_id, anchor["ts"], n),
+        ).fetchall()
+        return [self._to_message_row(r) for r in rows]
+
+    def recent_window(self, tg_chat_id: int, hours: int, limit: int = 200) -> list[MessageRow]:
+        since = int(time.time()) - hours * 3600
+        rows = self.conn.execute(
+            """
+            SELECT m.id, m.tg_message_id, m.tg_chat_id, se.display_name AS sender,
+                   m.ts, m.reply_to, m.kind, COALESCE(m.text, tr.text) AS text
+            FROM messages m LEFT JOIN senders se ON se.id = m.sender_id
+            LEFT JOIN transcripts tr ON tr.message_id = m.id
+            WHERE m.tg_chat_id = ? AND m.ts >= ?
+            ORDER BY m.ts DESC LIMIT ?
+            """,
+            (tg_chat_id, since, limit),
+        ).fetchall()
+        return [self._to_message_row(r) for r in reversed(rows)]
+
+    def stats(self) -> dict:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n, MIN(ts) AS first_ts, MAX(ts) AS last_ts FROM messages"
+        ).fetchone()
+        return dict(row)
+
+    @staticmethod
+    def _to_message_row(r: sqlite3.Row) -> MessageRow:
+        return MessageRow(
+            id=r["id"],
+            tg_message_id=r["tg_message_id"],
+            tg_chat_id=r["tg_chat_id"],
+            sender=r["sender"],
+            ts=r["ts"],
+            reply_to=r["reply_to"],
+            kind=r["kind"],
+            text=r["text"],
+        )
+
+
+def format_rows(rows: list[MessageRow]) -> str:
+    if not rows:
+        return "(ничего не найдено)"
+    return "\n".join(r.format() for r in rows)
+
+
+def parse_aliases(raw: str | None) -> list[str]:
+    return json.loads(raw) if raw else []
