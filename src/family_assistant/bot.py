@@ -9,25 +9,27 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
+from . import commands
 from .caption import CaptionWorker
 from .config import Settings
 from .embed import Embedder, EmbeddingWorker
 from .query import QueryEngine
 from .store import Store
 from .transcribe import TranscriptionWorker
+from .video import VideoWorker
 
 log = logging.getLogger(__name__)
 
 BOT_API_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # 20MB
 
-MEDIA_EXT = {"voice": ".oga", "video_note": ".mp4", "photo": ".jpg"}
+MEDIA_EXT = {"voice": ".oga", "video_note": ".mp4", "photo": ".jpg", "video": ".mp4"}
 
 router = Router()
 
@@ -104,6 +106,13 @@ class BotApp:
             settings.db_path, settings.media_dir, settings,
             embed_enqueue=self.embedding_worker.enqueue,
         )
+        # Videos: transcript + keyframe captions. Shares the whisper model with
+        # the transcription worker (lazy-loaded once); own Captioner instance.
+        self.video_worker = VideoWorker(
+            settings.db_path, settings.media_dir, settings,
+            transcriber=self.worker.transcriber,
+            embed_enqueue=self.embedding_worker.enqueue,
+        )
 
     def chat_allowed(self, chat_id: int) -> bool:
         allowed = self.settings.allowed_chat_ids
@@ -167,6 +176,38 @@ class BotApp:
         job_id = self.store.create_job(job_type="transcribe", ref_id=row_id)
         self.worker.enqueue(job_id)
 
+    async def ingest_video(self, message: Message, row_id: int) -> None:
+        """Download a video and enqueue a video job (transcript + keyframes)."""
+        video = message.video
+        if video is None:
+            return
+        file_size = video.file_size or 0
+        if file_size > BOT_API_DOWNLOAD_LIMIT:
+            # >20MB videos can't be fetched via the Bot API; archived but skipped
+            # (a fresh Desktop export backfills the local file — see ROADMAP).
+            self.store.insert_media(
+                message_id=row_id, kind="video", rel_path=None,
+                bytes=file_size, skipped=True,
+            )
+            log.warning("video %s too big to download (%d bytes)", row_id, file_size)
+            return
+
+        rel_path = f"live/{message.date:%Y/%m}/{message.message_id}{MEDIA_EXT['video']}"
+        abs_path = self.settings.media_dir / rel_path
+        abs_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            await self.bot.download(video.file_id, destination=abs_path)
+        except Exception:
+            log.exception("video download failed for message %s", message.message_id)
+            return
+
+        self.store.insert_media(
+            message_id=row_id, kind="video", rel_path=rel_path,
+            mime=getattr(video, "mime_type", None), bytes=file_size,
+        )
+        job_id = self.store.create_job(job_type="video", ref_id=row_id)
+        self.video_worker.enqueue(job_id)
+
     async def ingest_photo(self, message: Message, row_id: int) -> None:
         """Download the photo and enqueue a caption job (ref_id = media.id)."""
         photo = message.photo[-1]  # largest PhotoSize
@@ -218,12 +259,14 @@ class BotApp:
             log.warning(warning)
         self.worker.start()  # recovers unfinished transcription jobs
         self.caption_worker.start()  # recovers unfinished (non-batch) caption jobs
+        self.video_worker.start()  # recovers unfinished video jobs
         self.embedding_worker.start()  # recovers unfinished embed jobs
         try:
             await self.dp.start_polling(self.bot)
         finally:
             self.worker.stop()
             self.caption_worker.stop()
+            self.video_worker.stop()
             self.embedding_worker.stop()
 
 
@@ -246,6 +289,65 @@ async def cmd_stats(message: Message, app: BotApp) -> None:
     await message.reply(reply)
 
 
+@router.message(Command("spend"))
+async def cmd_spend(message: Message, app: BotApp) -> None:
+    if not app.chat_allowed(message.chat.id):
+        return
+    month = datetime.now().astimezone().strftime("%Y-%m")
+    rows = app.store.spend_summary(month)
+    await message.reply(commands.format_spend_reply(rows, month))
+
+
+@router.message(Command("find"))
+async def cmd_find(message: Message, command: CommandObject, app: BotApp) -> None:
+    if not app.chat_allowed(message.chat.id):
+        return
+    query = (command.args or "").strip()
+    if not query:
+        await message.reply("Использование: /find <что искать>")
+        return
+    rows = app.store.search(query, limit=10)
+    await message.reply(commands.format_find_reply(rows, query))
+
+
+@router.message(Command("wiki"))
+async def cmd_wiki(message: Message, command: CommandObject, app: BotApp) -> None:
+    if not app.chat_allowed(message.chat.id):
+        return
+    wiki = app.engine.agent.wiki
+    target = commands.resolve_wiki_target(command.args or "", wiki.list_pages())
+    if target is None:
+        await message.reply(wiki.read_index())
+        return
+    content = wiki.read_page(target)
+    await message.reply(content or "(страница не существует)")
+
+
+@router.message(Command("summary"))
+async def cmd_summary(message: Message, command: CommandObject, app: BotApp) -> None:
+    if not app.chat_allowed(message.chat.id):
+        return
+    wiki = app.engine.agent.wiki
+    label, start, end = commands.resolve_summary_window(command.args or "", date.today())
+    text = commands.format_summary_from_log(wiki.read_page("log.md"), label, start, end)
+    if text is not None:
+        await message.reply(text)
+        return
+    # No digest journal for the window — fall back to a fresh agent answer.
+    asker = message.from_user.full_name if message.from_user else "кто-то"
+    allowed = app.settings.allowed_chat_ids
+    chat_id = allowed[0] if allowed else message.chat.id
+    await app.bot.send_chat_action(message.chat.id, "typing")
+    try:
+        answer = await app.engine.agent.answer(
+            chat_id, f"Сделай краткое summary {label}", asker
+        )
+    except Exception:
+        log.exception("summary fallback failed")
+        answer = "Не получилось собрать сводку, попробуйте позже."
+    await message.reply(answer)
+
+
 @router.message(F.chat.type.in_({"group", "supergroup"}))
 async def on_group_message(message: Message, app: BotApp) -> None:
     if not app.chat_allowed(message.chat.id):
@@ -258,6 +360,8 @@ async def on_group_message(message: Message, app: BotApp) -> None:
         await app.ingest_media(message, row_id)
     elif row_id and message_kind(message) == "photo":
         await app.ingest_photo(message, row_id)
+    elif row_id and message_kind(message) == "video":
+        await app.ingest_video(message, row_id)
 
     if message.text and app.is_addressed_to_bot(message):
         msg_ts = int(message.date.timestamp())

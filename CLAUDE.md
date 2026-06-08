@@ -34,6 +34,13 @@ uv run python -m family_assistant.embed_backfill [--limit N] [--retry-errored]
                                       # local semantic-search embeddings (M6, $0); resumable
                                       # inline drain over every message with searchable text;
                                       # --limit N = trial; first run downloads the e5 model
+uv run python -m family_assistant.video_backfill [--limit N] [--retry-errored]
+                                      # transcribe + caption archived videos (M7); resumable
+                                      # inline drain; whisper $0, keyframe captions = live Haiku
+                                      # (video_keyframes per video, default 1); --limit = trial
+uv run python -m family_assistant.weekly
+                                      # post a 7-day chat recap stitched from log.md (M7, $0);
+                                      # opt-in (WEEKLY_SUMMARY_ENABLED=true), else a no-op
 uv run pytest                         # all tests
 uv run pytest tests/test_store.py -k trigram   # single test
 ```
@@ -74,12 +81,31 @@ Media messages are already logged as rows with empty content; later
 milestones attach transcripts/captions via `store.index_text(message_id, text)`,
 which makes them searchable (this path is tested).
 
-Jobs (`jobs` table) drive transcription (M2), captioning (M4) and embedding
-(M6). Watch the `ref_id` divergence: `transcribe` and `embed` jobs use
-`messages.id`, `caption` jobs use `media.id`. Caption jobs submitted to the
-Batch API carry `jobs.batch_id`; the live `CaptionWorker` must recover with
-`reset_stale_jobs("caption", unbatched_only=True)` so it never steals work
-the `caption_backfill` CLI is still polling for.
+Jobs (`jobs` table) drive transcription (M2), captioning (M4), embedding (M6)
+and video (M7). Watch the `ref_id` divergence: `transcribe`, `embed` and
+`video` jobs use `messages.id`, `caption` jobs use `media.id`. Caption jobs
+submitted to the Batch API carry `jobs.batch_id`; the live `CaptionWorker` must
+recover with `reset_stale_jobs("caption", unbatched_only=True)` so it never
+steals work the `caption_backfill` CLI is still polling for.
+
+Video (M7, `video.py`): a `VideoWorker` (same thread+WAL shape) composes the M2
+`Transcriber` — **shared** with the bot's `TranscriptionWorker` so whisper loads
+once — and its own `Captioner` (its `last_usage` is per-call state two threads
+would race on). Each video → one whisper transcript + `video_keyframes` keyframe
+captions (PyAV decodes audio and frames; default 1 keyframe), stitched by
+`build_video_text` into a single `transcripts` row + `index_text` (no per-frame
+media rows, no schema change). Search shows a `[видео]` prefix (`MessageRow.format`).
+Backfill via `video_backfill` (inline drain over `video_media_without_transcript`;
+live Haiku captions, **not** Batch).
+
+Token spend (M7): `store.record_spend(model=, usage=)` accumulates every
+Anthropic call's `usage` into the `spend(day, model, …)` table — called at
+**every** call site (router, agent, caption/video workers, digest, batch-collect
+tagged `<model>:batch` for the 50% discount). `pricing.py` holds the
+**approximate** per-MTok prices; `/spend` reports the month as an estimate and
+flags unpriced models. Routing has a cheap `shortcut_intent` (router.py) that
+bypasses the Haiku router for unambiguous Russian openings; `engine.handle` does
+`shortcut_intent(q) or classify_intent(...)`.
 
 Semantic search (M6, `embed.py`): a local sentence-transformers worker
 (`EmbeddingWorker`, same thread+WAL shape as the others) embeds each message's

@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.family.tgweekly</string>
+
+  <!-- Weekly chat summary (M7): posts a recap of the last 7 days to the chat,
+       then exits. Opt-in via WEEKLY_SUMMARY_ENABLED=true in .env; a no-op
+       otherwise. NOT KeepAlive — one-shot, like the digest job. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__UV__</string>
+    <string>run</string>
+    <string>--project</string>
+    <string>__PROJECT_DIR__</string>
+    <string>python</string>
+    <string>-m</string>
+    <string>family_assistant.weekly</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__PROJECT_DIR__</string>
+
+  <!-- Sunday 18:00. If the Mac is asleep then, launchd runs the job on the next
+       wake; it's a once-a-week courtesy post, so a late delivery is fine. -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key>
+    <integer>0</integer>
+    <key>Hour</key>
+    <integer>18</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>__PROJECT_DIR__/data/weekly.log</string>
+  <key>StandardErrorPath</key>
+  <string>__PROJECT_DIR__/data/weekly.log</string>
+</dict>
+</plist>

@@ -198,6 +198,10 @@ def _collect_batch(
             continue
         _, media_id = ref
         if result.result.type == "succeeded":
+            usage = getattr(result.result.message, "usage", None)
+            if usage is not None:
+                # Tag batched spend so /spend prices it at the 50% discount.
+                store.record_spend(model=settings.caption_model + ":batch", usage=usage)
             text = response_text(result.result.message.content)
             if text:
                 store.insert_caption(

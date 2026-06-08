@@ -89,3 +89,17 @@ CREATE TABLE IF NOT EXISTS embeddings (
   UNIQUE(message_id, chunk_index, model)
 );
 CREATE INDEX IF NOT EXISTS idx_embeddings_message ON embeddings(message_id);
+
+-- Token spend accounting (M7) — one row per local day per model, accumulated
+-- from every Anthropic API call's `usage`. cache_write/cached split out because
+-- they bill at distinct rates (see pricing.py). `/spend` reports the month.
+CREATE TABLE IF NOT EXISTS spend (
+  day                TEXT NOT NULL,            -- local 'YYYY-MM-DD'
+  model              TEXT NOT NULL,            -- e.g. claude-haiku-4-5, ...:batch
+  in_tokens          INTEGER NOT NULL DEFAULT 0,  -- uncached input
+  cached_tokens      INTEGER NOT NULL DEFAULT 0,  -- cache_read_input_tokens
+  cache_write_tokens INTEGER NOT NULL DEFAULT 0,  -- cache_creation_input_tokens
+  out_tokens         INTEGER NOT NULL DEFAULT 0,
+  calls              INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(day, model)
+);

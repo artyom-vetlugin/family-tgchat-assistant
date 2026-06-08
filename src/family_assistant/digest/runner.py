@@ -115,10 +115,11 @@ def _final_text(response) -> str:
 class DigestAgent:
     """Haiku tool-loop that maintains wiki pages for one period of messages."""
 
-    def __init__(self, client, settings: Settings, wiki: Wiki):
+    def __init__(self, client, settings: Settings, wiki: Wiki, store: Store | None = None):
         self.client = client
         self.settings = settings
         self.wiki = wiki
+        self.store = store  # records token spend (M7) when provided
 
     def _system_blocks(self) -> list[dict]:
         # guide (frozen) + start-of-period index snapshot; cache covers both.
@@ -169,6 +170,10 @@ class DigestAgent:
                 system=system,
                 messages=messages,
             )
+            if self.store is not None:
+                self.store.record_spend(
+                    model=self.settings.digest_model, usage=response.usage
+                )
             turns += 1
             log.info(
                 "digest turn: stop=%s in=%s cached=%s out=%s",
@@ -209,6 +214,10 @@ class DigestAgent:
             system=system,
             messages=messages,
         )
+        if self.store is not None:
+            self.store.record_spend(
+                model=self.settings.digest_model, usage=response.usage
+            )
         turns += 1
         return _final_text(response), pages_written, turns
 
@@ -286,7 +295,7 @@ def run_digest(
         report.note = "nothing to digest (already up to date)"
         return report
 
-    agent = DigestAgent(client, settings, wiki)
+    agent = DigestAgent(client, settings, wiki, store=store)
     for win_start, win_end in _periods(report.mode, start, end):
         rows = store.messages_between(
             chat_id, _day_start_ts(win_start), _day_start_ts(win_end + timedelta(days=1))

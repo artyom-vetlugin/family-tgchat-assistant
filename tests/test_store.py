@@ -252,3 +252,52 @@ def test_insert_transcript(store):
         "SELECT text FROM transcripts WHERE message_id = ?", (row_id,)
     ).fetchone()
     assert row["text"] == "привет два"
+
+
+# --- spend accounting (M7) -------------------------------------------------
+
+
+def _usage(inp=0, cached=0, cache_write=0, out=0):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        input_tokens=inp,
+        cache_read_input_tokens=cached,
+        cache_creation_input_tokens=cache_write,
+        output_tokens=out,
+    )
+
+
+def test_record_spend_accumulates_per_day_model(store):
+    store.record_spend(
+        model="claude-haiku-4-5", usage=_usage(inp=100, out=10), day="2026-06-01"
+    )
+    store.record_spend(
+        model="claude-haiku-4-5", usage=_usage(inp=50, cached=20, out=5), day="2026-06-01"
+    )
+    rows = store.spend_summary("2026-06")
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["in_tokens"] == 150
+    assert r["cached_tokens"] == 20
+    assert r["out_tokens"] == 15
+    assert r["calls"] == 2
+
+
+def test_record_spend_missing_cache_fields_default_zero(store):
+    from types import SimpleNamespace
+
+    # router json_schema usage may omit cache fields entirely
+    usage = SimpleNamespace(input_tokens=42, output_tokens=3)
+    store.record_spend(model="claude-haiku-4-5", usage=usage, day="2026-06-02")
+    rows = store.spend_summary("2026-06")
+    assert rows[0]["cache_write_tokens"] == 0
+
+
+def test_spend_summary_filters_by_month_and_groups_by_model(store):
+    store.record_spend(model="claude-haiku-4-5", usage=_usage(inp=10), day="2026-06-01")
+    store.record_spend(model="claude-sonnet-4-6", usage=_usage(inp=20), day="2026-06-15")
+    store.record_spend(model="claude-haiku-4-5", usage=_usage(inp=99), day="2026-05-30")
+    rows = store.spend_summary("2026-06")
+    models = {r["model"]: r["in_tokens"] for r in rows}
+    assert models == {"claude-haiku-4-5": 10, "claude-sonnet-4-6": 20}

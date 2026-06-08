@@ -47,7 +47,7 @@ Ingestion pipeline
   voice/circle → faster-whisper large-v3-turbo (local)   [M2 ✅]
   image        → Haiku vision caption (Batch API)        [M4 ✅]
   text/voice/image → e5 local embeddings (semantic search) [M6 ✅]
-  video        → ffmpeg audio → whisper (+ keyframes)    [M7]
+  video        → PyAV audio → whisper + keyframe captions [M7 ✅]
         │
 Storage — three LLM-Wiki layers
   Layer 1: SQLite (WAL) + FTS5 trigram + media/   ← raw, immutable [M1 ✅]
@@ -61,8 +61,12 @@ Query engine [M1 ✅]
   Agent tools: fts_search, get_messages_around, recent_window      [M1 ✅]
                read_wiki_page, list_wiki_index                     [M5 ✅]
                semantic_search                                     [M6 ✅]
+  Shortcut: skip the router for obvious openings (найди…/итоги…)   [M7 ✅]
+  Commands: /find /wiki /summary /spend                            [M7 ✅]
         │
 Nightly digest job (Haiku, launchd timer) → maintains wiki + log.md [M5 ✅]
+Weekly summary job (launchd, Sun 18:00) → posts log.md recap        [M7 ✅]
+Token spend → spend table, every API call; /spend reports the month [M7 ✅]
 Backfill job (one-time) → parses Desktop export result.json        [M3]
 ```
 
@@ -300,9 +304,37 @@ messages; `--limit 50` trial embedded 50/50, 0 errored, 384-dim/1536-byte vector
 **Accept:** paraphrase queries that FTS misses return correct results;
 $0 embedding cost; ingest latency still fine.
 
-### M7 — Video understanding + polish
+### M7 — Video understanding + polish ✅ DONE
 
-**Scope:**
+**Implemented (four sub-phases):**
+- **M7a token spend** — `spend(day, model, in/cached/cache_write/out tokens, calls)`
+  table (cache-write split out; bills at a distinct rate). `store.record_spend`
+  reads any `usage` defensively and is called at **every** Anthropic call site
+  (router, agent ×3, caption worker, digest ×2, batch-collect tagged `:batch`
+  at 50%). `pricing.py` holds the **approximate** per-MTok price table (Haiku
+  $1/$5, Sonnet $3/$15; cached 0.1×, cache-write 1.25×) — `/spend` labels the
+  estimate «приблизительно» and flags unpriced models instead of silent $0.
+- **M7b commands + routing** — `/spend`, `/find <query>` (FTS), `/wiki <topic>`
+  (reads a page or the index), `/summary [period]` (stitches log.md, falls back
+  to the agent). Bodies are pure functions in `commands.py` (testable without a
+  dispatcher). `router.shortcut_intent` bypasses the Haiku router for
+  unambiguous Russian openings ("найди…"→search, "что обсуждали…"→summarize),
+  saving the call + its spend; `engine.handle` does `shortcut or classify`.
+- **M7c video** — `video.py` `VideoWorker` composes the M2 `Transcriber` (shared
+  with the bot's transcription worker — one whisper load) and an own `Captioner`
+  (its `last_usage` is per-call state). Each video → one whisper transcript +
+  `video_keyframes` keyframe captions (default 1; PyAV decodes both audio and
+  frames, no ffmpeg dep), stitched by `build_video_text` into one `transcripts`
+  row + FTS/semantic index (no schema change). `video` jobs use ref_id=messages.id;
+  search shows a `[видео]` prefix. `bot.ingest_video` mirrors `ingest_media`
+  (>20MB → skipped=1). `caption.encode_pil_image`/`Captioner.caption_pil` added.
+  Backfill: `video_backfill` CLI (inline drain, `--limit`/`--retry-errored`,
+  resumable via `video_media_without_transcript`; live Haiku, not Batch).
+- **M7d weekly summary** — `weekly/` standalone job posts a 7-day recap to the
+  chat, stitched from log.md ($0); opt-in `weekly_summary_enabled`; builds its
+  own send-only `Bot`. launchd `deploy/com.family.tgweekly.plist` (Sunday 18:00).
+
+**Original scope:**
 - Video ingest: ffmpeg extract audio → whisper transcript; sample 1–3
   keyframes → Haiku caption; both indexed. Skip >20MB live videos (already
   flagged); backfilled export videos are local so size is no issue.
@@ -316,7 +348,11 @@ $0 embedding cost; ingest latency still fine.
   (starts with "найди" → search_history).
 
 **Accept:** videos searchable by spoken content; weekly auto-summary posts;
-monthly spend visible and within ~$3–10.
+monthly spend visible and within ~$3–10. **To verify on real data:** drop an
+`.mp4` in the chat (or `video_backfill --limit 1` on an export video) and search
+its spoken/visual content; reconcile `/spend` against the Anthropic console
+after a day of traffic; confirm `cache_read_input_tokens` still lands on agent
+turns 2..N (the spend wiring reads `usage`, doesn't change cache placement).
 
 ---
 
@@ -346,43 +382,54 @@ monthly spend visible and within ~$3–10.
 - All data stays local except retrieval slices/images sent to Anthropic for
   answering/captioning (user-accepted tradeoff).
 
-## Current file map (M6)
+## Current file map (M7)
 
 ```
 src/family_assistant/
-├── bot.py            # aiogram handlers; BotApp; logging + @mention answering
+├── bot.py            # aiogram handlers; BotApp; logging + @mention answering;
+│                     #        /find /wiki /summary /spend commands (M7)
 ├── config.py         # pydantic-settings; .env; models, paths, limits
 ├── __main__.py       # python -m family_assistant
+├── pricing.py        # M7: approximate per-MTok price table + estimate_usd (/spend)
+├── commands.py       # M7: pure helpers behind /find /wiki /summary /spend
 ├── transcribe.py     # M2: Transcriber (faster-whisper) + TranscriptionWorker
-├── caption.py        # M4: CAPTION_PROMPT, encode_image, Captioner + CaptionWorker
+├── caption.py        # M4: CAPTION_PROMPT, encode_image/encode_pil_image, Captioner
+│                     #        (caption / caption_pil) + CaptionWorker
 ├── caption_backfill/ # M4: Batch API photo captioning CLI (resumable)
 │   ├── runner.py     # enqueue → submit chunks → poll/collect; jobs.batch_id resume
 │   └── __main__.py   # CLI: python -m family_assistant.caption_backfill [--max-batches N] [--retry-errored]
+├── video.py          # M7: VideoWorker (transcript + keyframe captions), extract_keyframes, build_video_text
+├── video_backfill/   # M7: local video backfill CLI (resumable; live Haiku captions)
+│   ├── runner.py     # enqueue export videos → inline drain via VideoWorker.process
+│   └── __main__.py   # CLI: python -m family_assistant.video_backfill [--limit N] [--retry-errored]
 ├── embed.py          # M6: chunk_text, Embedder (e5, sentence-transformers) + EmbeddingWorker
 ├── embed_backfill/   # M6: local embedding backfill CLI (resumable, $0)
 │   ├── runner.py     # enqueue → inline drain; report; per-model/message dedup
 │   └── __main__.py   # CLI: python -m family_assistant.embed_backfill [--limit N] [--retry-errored]
 ├── wiki.py           # M5: Wiki — Layer 2 I/O, path validation, auto-index, log watermark
 ├── digest/           # M5: nightly wiki digest
-│   ├── runner.py     # DigestAgent (Haiku tool-loop) + run_digest (daily / monthly seed)
+│   ├── runner.py     # DigestAgent (Haiku tool-loop, records spend) + run_digest
 │   └── __main__.py   # CLI: python -m family_assistant.digest [--date YYYY-MM-DD] [--rebuild]
+├── weekly/           # M7: opt-in weekly chat recap (stitched from log.md, $0)
+│   ├── runner.py     # build_weekly_text + run_weekly (send-only Bot)
+│   └── __main__.py   # CLI: python -m family_assistant.weekly
 ├── store/
-│   ├── schema.sql    # full schema incl. M2-M6 tables (media/transcripts/captions/jobs/embeddings)
-│   └── db.py         # Store: upsert_sender, insert_message, index_text, search,
-│                     #        get_messages_around, recent_window, messages_between, stats,
-│                     #        text_for_message, replace_embeddings, messages_needing_embedding, knn
+│   ├── schema.sql    # full schema incl. M2-M7 tables (media/transcripts/captions/jobs/embeddings/spend)
+│   └── db.py         # Store: …, record_spend, spend_summary,
+│                     #        video_media_without_transcript, knn
 ├── query/
-│   ├── router.py     # classify_intent (Haiku, structured output)
-│   ├── agent.py      # RetrievalAgent: TOOLS (+wiki +semantic_search), manual loop,
-│   │                 #        prompt caching, answer / answer_generic
-│   └── engine.py     # QueryEngine.handle: route → answer (shares one Embedder)
+│   ├── router.py     # classify_intent (Haiku) + shortcut_intent (keyword bypass)
+│   ├── agent.py      # RetrievalAgent: TOOLS (+wiki +semantic_search), records spend
+│   └── engine.py     # QueryEngine.handle: shortcut or route → answer (shares one Embedder)
 └── backfill/         # M3: Telegram Desktop export import
     ├── parser.py     # pure result.json parsing → ParsedMessage
     ├── media.py      # copy export files → media/export/YYYY/MM/, sha256
     ├── runner.py     # dedup-at-insert, media attach, BackfillReport
     └── __main__.py   # CLI: python -m family_assistant.backfill
 schema/wiki_guide.md  # M5: Layer 3 — human-edited wiki maintenance rules (in git)
-tests/                # store/FTS, transcription, backfill, captioning, wiki, digest, embed (104 tests)
+tests/                # store/FTS, transcription, backfill, captioning, wiki, digest,
+                      #        embed, pricing, commands, router, video, weekly (136 tests)
 deploy/com.family.tgassistant.plist   # bot (KeepAlive)
 deploy/com.family.tgdigest.plist      # M5: nightly digest (StartCalendarInterval 03:00)
+deploy/com.family.tgweekly.plist      # M7: weekly summary (Sunday 18:00, opt-in)
 ```

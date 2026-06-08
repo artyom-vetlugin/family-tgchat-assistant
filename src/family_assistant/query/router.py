@@ -33,8 +33,27 @@ ROUTER_SCHEMA = {
     "additionalProperties": False,
 }
 
+# Unambiguous Russian openings that don't need the Haiku router (M7) — skipping
+# it saves a call (and its spend). Keep conservative: only heads where the
+# intent is obvious. Everything else falls through to classify_intent.
+_SEARCH_PREFIXES = ("найди", "найти", "поищи", "ищи", "покажи ")
+_SUMMARY_PREFIXES = ("что обсуждали", "о чём говорили", "о чем говорили",
+                     "подведи итог", "сделай summary", "итоги ")
 
-async def classify_intent(client: AsyncAnthropic, model: str, question: str) -> str:
+
+def shortcut_intent(question: str) -> str | None:
+    """Cheap keyword shortcut around the Haiku router; None = ask the model."""
+    q = question.strip().lower()
+    if q.startswith(_SEARCH_PREFIXES):
+        return "search_history"
+    if q.startswith(_SUMMARY_PREFIXES):
+        return "summarize"
+    return None
+
+
+async def classify_intent(
+    client: AsyncAnthropic, model: str, question: str, store=None
+) -> str:
     try:
         response = await client.messages.create(
             model=model,
@@ -43,6 +62,8 @@ async def classify_intent(client: AsyncAnthropic, model: str, question: str) -> 
             output_config={"format": {"type": "json_schema", "schema": ROUTER_SCHEMA}},
             messages=[{"role": "user", "content": question}],
         )
+        if store is not None:
+            store.record_spend(model=model, usage=response.usage)
         text = next(b.text for b in response.content if b.type == "text")
         intent = json.loads(text)["intent"]
         if intent in INTENTS:

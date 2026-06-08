@@ -241,6 +241,9 @@ class RetrievalAgent:
                 ],
                 messages=messages,
             )
+            self.store.record_spend(
+                model=self.settings.answer_model, usage=response.usage
+            )
             log.info(
                 "agent turn: stop=%s in=%s cached=%s out=%s",
                 response.stop_reason,
@@ -287,6 +290,7 @@ class RetrievalAgent:
             tool_choice={"type": "none"},
             messages=messages,
         )
+        self.store.record_spend(model=self.settings.answer_model, usage=response.usage)
         return _final_text(response)
 
     async def answer_generic(self, question: str, asker: str) -> str:
@@ -297,6 +301,7 @@ class RetrievalAgent:
             system="Ты — дружелюбный ассистент в семейном телеграм-чате. Отвечай по-русски, кратко и по делу.",
             messages=[{"role": "user", "content": question}],
         )
+        self.store.record_spend(model=self.settings.answer_model, usage=response.usage)
         return _final_text(response)
 
 

@@ -41,6 +41,8 @@ class MessageRow:
                 prefix = "[голосовое] "
             elif self.kind == "photo":
                 prefix = "[фото] "
+            elif self.kind == "video":
+                prefix = "[видео] "
             else:
                 prefix = ""
             body = prefix + self.text
@@ -292,6 +294,23 @@ class Store:
             """
         ).fetchall()
         return [r["id"] for r in rows]
+
+    def video_media_without_transcript(self) -> list[int]:
+        """message_ids of downloaded videos with no transcript yet (M7 backfill).
+
+        Video jobs use ref_id = messages.id, so this returns message ids. Export
+        videos land as media rows with no job; this is the backfill enqueue source
+        (resumable: a transcript already present makes a re-run skip the row)."""
+        rows = self.conn.execute(
+            """
+            SELECT m.message_id FROM media m
+            LEFT JOIN transcripts tr ON tr.message_id = m.message_id
+            WHERE m.kind = 'video' AND m.rel_path IS NOT NULL AND m.skipped = 0
+              AND tr.id IS NULL
+            ORDER BY m.message_id
+            """
+        ).fetchall()
+        return [r["message_id"] for r in rows]
 
     def create_job(self, *, job_type: str, ref_id: int) -> int:
         cur = self.conn.execute(
@@ -649,6 +668,56 @@ class Store:
             "SELECT COUNT(*) AS n, MIN(ts) AS first_ts, MAX(ts) AS last_ts FROM messages"
         ).fetchone()
         return dict(row)
+
+    # --- token spend accounting (M7) ----------------------------------------
+
+    def record_spend(self, *, model: str, usage, day: str | None = None) -> None:
+        """Accumulate one Anthropic call's token usage into the `spend` table.
+
+        `usage` is any object exposing the Anthropic usage fields; cache fields
+        are read defensively (the router's json_schema call and generic answers
+        may omit them). `day` defaults to the local date. Called at every API
+        call site so `/spend` can report the month."""
+        if day is None:
+            day = datetime.now().astimezone().strftime("%Y-%m-%d")
+        in_tokens = getattr(usage, "input_tokens", 0) or 0
+        cached = getattr(usage, "cache_read_input_tokens", 0) or 0
+        cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
+        out_tokens = getattr(usage, "output_tokens", 0) or 0
+        self.conn.execute(
+            """
+            INSERT INTO spend
+              (day, model, in_tokens, cached_tokens, cache_write_tokens, out_tokens, calls)
+            VALUES (?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(day, model) DO UPDATE SET
+              in_tokens          = in_tokens + excluded.in_tokens,
+              cached_tokens      = cached_tokens + excluded.cached_tokens,
+              cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
+              out_tokens         = out_tokens + excluded.out_tokens,
+              calls              = calls + 1
+            """,
+            (day, model, in_tokens, cached, cache_write, out_tokens),
+        )
+        self.conn.commit()
+
+    def spend_summary(self, month: str) -> list[dict]:
+        """Per-model token totals for a 'YYYY-MM' month, for the `/spend` report."""
+        rows = self.conn.execute(
+            """
+            SELECT model,
+                   SUM(in_tokens)          AS in_tokens,
+                   SUM(cached_tokens)      AS cached_tokens,
+                   SUM(cache_write_tokens) AS cache_write_tokens,
+                   SUM(out_tokens)         AS out_tokens,
+                   SUM(calls)              AS calls
+            FROM spend
+            WHERE day LIKE ?
+            GROUP BY model
+            ORDER BY model
+            """,
+            (month + "-%",),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     @staticmethod
     def _to_message_row(r: sqlite3.Row) -> MessageRow:

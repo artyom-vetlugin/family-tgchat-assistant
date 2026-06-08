@@ -113,6 +113,19 @@ nights self-heal because the digest catches up from the `log.md` watermark to
 yesterday. To run reliably overnight, schedule a wake with e.g.
 `sudo pmset repeat wakeorpoweron MTWRFSU 02:55:00`.
 
+The optional weekly chat recap (M7) is a third one-shot job (Sunday 18:00). It's
+off by default — set `WEEKLY_SUMMARY_ENABLED=true` in `.env` to enable, then:
+
+```bash
+sed "s|__PROJECT_DIR__|$(pwd)|g; s|__UV__|$(which uv)|g" deploy/com.family.tgweekly.plist \
+  > ~/Library/LaunchAgents/com.family.tgweekly.plist
+launchctl load ~/Library/LaunchAgents/com.family.tgweekly.plist
+tail -f data/weekly.log
+```
+
+It posts a 7-day recap stitched from `wiki/log.md` (so it needs the digest to
+have been running). Same wake caveat as the digest — a missed Sunday posts late.
+
 Note: when the Mac sleeps, Telegram holds undelivered updates for ~24h and the
 bot catches up on wake: the backlog is archived (and voice transcribed), but
 questions older than 30 minutes (`ANSWER_MAX_AGE_MINUTES`) are not answered —

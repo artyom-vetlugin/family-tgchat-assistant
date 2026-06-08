@@ -63,6 +63,14 @@ class Settings(BaseSettings):
     # Which chat the digest summarises. Empty → first of allowed_chat_ids.
     digest_chat_id: int | None = None
 
+    # Video understanding (M7) — whisper transcript + N keyframe captions (Haiku
+    # vision). Keyframes reuse the caption model/resize/quality settings; default
+    # 1 keeps backfill cost minimal (transcript carries most search value).
+    video_keyframes: int = 1
+
+    # Weekly chat summary (M7) — opt-in launchd job; stitches wiki/log.md ($0).
+    weekly_summary_enabled: bool = False
+
     # Semantic search (M6) — local sentence-transformers, $0 (CPU on Apple Silicon).
     # e5 wants `query: ` / `passage: ` prefixes; embeddings are L2-normalized so
     # cosine == dot product. Weights cache under models_dir (shared with whisper).

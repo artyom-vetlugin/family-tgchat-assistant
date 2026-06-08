@@ -38,6 +38,19 @@ CAPTION_PROMPT = (
 IMAGE_MIME = "image/jpeg"
 
 
+def encode_pil_image(img, *, long_edge: int = 1024, quality: int = 80) -> str:
+    """Resize a PIL image to <=long_edge px and return a base64 JPEG string.
+
+    Shared by the photo path (encode_image, from a file) and the video path
+    (M7, from an in-memory keyframe) — neither touches an on-disk original, so
+    Layer 1 stays immutable. Resizing only shrinks what goes over the wire."""
+    img = img.convert("RGB")  # PNG/WebP/GIF (first frame) / video frame → JPEG-able
+    img.thumbnail((long_edge, long_edge))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality)
+    return base64.standard_b64encode(buf.getvalue()).decode("ascii")
+
+
 def encode_image(path: Path, *, long_edge: int = 1024, quality: int = 80) -> str:
     """Resize to <=long_edge px and re-encode as JPEG; return base64 string.
 
@@ -48,11 +61,7 @@ def encode_image(path: Path, *, long_edge: int = 1024, quality: int = 80) -> str
     from PIL import Image  # local import keeps bot startup lean
 
     with Image.open(path) as img:
-        img = img.convert("RGB")  # PNG/WebP/GIF (first frame) → JPEG-able
-        img.thumbnail((long_edge, long_edge))
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=quality)
-    return base64.standard_b64encode(buf.getvalue()).decode("ascii")
+        return encode_pil_image(img, long_edge=long_edge, quality=quality)
 
 
 def image_content_block(b64: str) -> dict:
@@ -87,6 +96,8 @@ class Captioner:
     def __init__(self, settings: Settings):
         self.settings = settings
         self._client = None
+        # usage of the most recent call — workers read it to record spend (M7).
+        self.last_usage = None
 
     @property
     def model(self) -> str:
@@ -99,19 +110,32 @@ class Captioner:
             self._client = anthropic.Anthropic(api_key=self.settings.anthropic_api_key)
         return self._client
 
-    def caption(self, path: Path) -> str:
-        b64 = encode_image(
-            path,
-            long_edge=self.settings.caption_resize_long_edge,
-            quality=self.settings.caption_jpeg_quality,
-        )
+    def _caption_b64(self, b64: str) -> str:
         response = self._load().messages.create(
             model=self.settings.caption_model,
             max_tokens=self.settings.caption_max_tokens,
             system=caption_system_blocks(),
             messages=[{"role": "user", "content": [image_content_block(b64)]}],
         )
+        self.last_usage = response.usage
         return response_text(response.content)
+
+    def caption(self, path: Path) -> str:
+        b64 = encode_image(
+            path,
+            long_edge=self.settings.caption_resize_long_edge,
+            quality=self.settings.caption_jpeg_quality,
+        )
+        return self._caption_b64(b64)
+
+    def caption_pil(self, img) -> str:
+        """Caption an in-memory PIL image (M7 video keyframes)."""
+        b64 = encode_pil_image(
+            img,
+            long_edge=self.settings.caption_resize_long_edge,
+            quality=self.settings.caption_jpeg_quality,
+        )
+        return self._caption_b64(b64)
 
 
 class CaptionWorker:
@@ -187,6 +211,9 @@ class CaptionWorker:
                 raise FileNotFoundError(f"no media file recorded for media {media_id}")
             message_id, rel_path, _skipped = media
             text = self.captioner.caption(self.media_dir / rel_path)
+            usage = getattr(self.captioner, "last_usage", None)
+            if usage is not None:
+                store.record_spend(model=self.captioner.model, usage=usage)
             if text:
                 store.insert_caption(
                     media_id=media_id, text=text, model=self.captioner.model
