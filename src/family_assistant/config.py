@@ -45,6 +45,14 @@ class Settings(BaseSettings):
     models_dir: Path = PROJECT_ROOT / "models"
     job_max_attempts: int = 3
 
+    # Image captioning (M4) — Haiku vision; Batch API for the backfill
+    caption_model: str = "claude-haiku-4-5"
+    caption_max_tokens: int = 256
+    caption_batch_chunk: int = 500  # requests per batch (256MB API cap headroom)
+    caption_poll_seconds: int = 30
+    caption_resize_long_edge: int = 1024  # resize before sending (token cost ↓)
+    caption_jpeg_quality: int = 80
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "chat.db"

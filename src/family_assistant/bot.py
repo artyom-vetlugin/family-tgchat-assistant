@@ -16,6 +16,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
 from aiogram.types import Message
 
+from .caption import CaptionWorker
 from .config import Settings
 from .query import QueryEngine
 from .store import Store
@@ -25,7 +26,7 @@ log = logging.getLogger(__name__)
 
 BOT_API_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # 20MB
 
-MEDIA_EXT = {"voice": ".oga", "video_note": ".mp4"}
+MEDIA_EXT = {"voice": ".oga", "video_note": ".mp4", "photo": ".jpg"}
 
 router = Router()
 
@@ -89,6 +90,9 @@ class BotApp:
         self.worker = TranscriptionWorker(
             settings.db_path, settings.media_dir, settings
         )
+        self.caption_worker = CaptionWorker(
+            settings.db_path, settings.media_dir, settings
+        )
 
     def chat_allowed(self, chat_id: int) -> bool:
         allowed = self.settings.allowed_chat_ids
@@ -148,6 +152,34 @@ class BotApp:
         job_id = self.store.create_job(job_type="transcribe", ref_id=row_id)
         self.worker.enqueue(job_id)
 
+    async def ingest_photo(self, message: Message, row_id: int) -> None:
+        """Download the photo and enqueue a caption job (ref_id = media.id)."""
+        photo = message.photo[-1]  # largest PhotoSize
+        file_size = photo.file_size or 0
+        if file_size > BOT_API_DOWNLOAD_LIMIT:  # photos always fit; defensive
+            self.store.insert_media(
+                message_id=row_id, kind="photo", rel_path=None,
+                bytes=file_size, skipped=True,
+            )
+            log.warning("photo %s too big to download (%d bytes)", row_id, file_size)
+            return
+
+        rel_path = f"live/{message.date:%Y/%m}/{message.message_id}{MEDIA_EXT['photo']}"
+        abs_path = self.settings.media_dir / rel_path
+        abs_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            await self.bot.download(photo.file_id, destination=abs_path)
+        except Exception:
+            log.exception("photo download failed for message %s", message.message_id)
+            return
+
+        media_id = self.store.insert_media(
+            message_id=row_id, kind="photo", rel_path=rel_path,
+            mime="image/jpeg", bytes=file_size,
+        )
+        job_id = self.store.create_job(job_type="caption", ref_id=media_id)
+        self.caption_worker.enqueue(job_id)
+
     def is_addressed_to_bot(self, message: Message) -> bool:
         """True when the bot is @mentioned or the message replies to the bot."""
         if message.reply_to_message and message.reply_to_message.from_user:
@@ -170,10 +202,12 @@ class BotApp:
         if warning:
             log.warning(warning)
         self.worker.start()  # recovers unfinished transcription jobs
+        self.caption_worker.start()  # recovers unfinished (non-batch) caption jobs
         try:
             await self.dp.start_polling(self.bot)
         finally:
             self.worker.stop()
+            self.caption_worker.stop()
 
 
 @router.message(Command("id"))
@@ -205,6 +239,8 @@ async def on_group_message(message: Message, app: BotApp) -> None:
 
     if row_id and message_kind(message) in ("voice", "video_note"):
         await app.ingest_media(message, row_id)
+    elif row_id and message_kind(message) == "photo":
+        await app.ingest_photo(message, row_id)
 
     if message.text and app.is_addressed_to_bot(message):
         msg_ts = int(message.date.timestamp())

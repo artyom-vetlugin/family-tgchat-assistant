@@ -35,7 +35,12 @@ class MessageRow:
 
     def format(self) -> str:
         if self.text:
-            prefix = f"[голосовое] " if self.kind in ("voice", "video_note") else ""
+            if self.kind in ("voice", "video_note"):
+                prefix = "[голосовое] "
+            elif self.kind == "photo":
+                prefix = "[фото] "
+            else:
+                prefix = ""
             body = prefix + self.text
         else:
             body = f"[{self.kind} без текста]"
@@ -238,6 +243,37 @@ class Store:
         )
         self.conn.commit()
 
+    def media_row(self, media_id: int) -> tuple[int, str | None, bool] | None:
+        """Returns (message_id, rel_path, skipped) for a media row, or None."""
+        row = self.conn.execute(
+            "SELECT message_id, rel_path, skipped FROM media WHERE id = ?",
+            (media_id,),
+        ).fetchone()
+        return (row["message_id"], row["rel_path"], bool(row["skipped"])) if row else None
+
+    def insert_caption(self, *, media_id: int, text: str, model: str) -> None:
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO captions (media_id, text, model, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (media_id, text, model, int(time.time())),
+        )
+        self.conn.commit()
+
+    def photo_media_without_caption(self) -> list[int]:
+        """Media ids of downloaded photos that have no caption yet (M4 backfill)."""
+        rows = self.conn.execute(
+            """
+            SELECT m.id FROM media m
+            LEFT JOIN captions c ON c.media_id = m.id
+            WHERE m.kind = 'photo' AND m.rel_path IS NOT NULL AND m.skipped = 0
+              AND c.id IS NULL
+            ORDER BY m.id
+            """
+        ).fetchall()
+        return [r["id"] for r in rows]
+
     def create_job(self, *, job_type: str, ref_id: int) -> int:
         cur = self.conn.execute(
             "INSERT OR IGNORE INTO jobs (job_type, ref_id, updated_at) VALUES (?, ?, ?)",
@@ -296,11 +332,58 @@ class Store:
         ).fetchall()
         return [r["id"] for r in rows]
 
-    def reset_stale_jobs(self, job_type: str) -> int:
-        """Recover jobs left 'inflight' by a previous run (crash/restart)."""
-        cur = self.conn.execute(
+    def set_job_batch(self, job_id: int, batch_id: str) -> None:
+        """Record the Anthropic Batch API id so a killed run can resume polling."""
+        self.conn.execute(
+            "UPDATE jobs SET batch_id = ?, updated_at = ? WHERE id = ?",
+            (batch_id, int(time.time()), job_id),
+        )
+        self.conn.commit()
+
+    def batch_ids_for_jobs(self, job_type: str) -> list[str]:
+        """Batch ids still attached to inflight jobs (in-progress Batch API work)."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT batch_id FROM jobs "
+            "WHERE job_type = ? AND state = 'inflight' AND batch_id IS NOT NULL "
+            "ORDER BY batch_id",
+            (job_type,),
+        ).fetchall()
+        return [r["batch_id"] for r in rows]
+
+    def job_state(self, job_id: int) -> tuple[str, str | None] | None:
+        """(state, batch_id) for a job, or None."""
+        row = self.conn.execute(
+            "SELECT state, batch_id FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        return (row["state"], row["batch_id"]) if row else None
+
+    def reset_stale_jobs(self, job_type: str, *, unbatched_only: bool = False) -> int:
+        """Recover jobs left 'inflight' by a previous run (crash/restart).
+
+        unbatched_only=True leaves jobs attached to an Anthropic batch alone —
+        those are legitimately in flight at the API, not stale (the caption
+        worker must not steal work the backfill CLI is still polling for).
+        """
+        sql = (
             "UPDATE jobs SET state = 'pending', updated_at = ? "
-            "WHERE job_type = ? AND state = 'inflight'",
+            "WHERE job_type = ? AND state = 'inflight'"
+        )
+        if unbatched_only:
+            sql += " AND batch_id IS NULL"
+        cur = self.conn.execute(sql, (int(time.time()), job_type))
+        self.conn.commit()
+        return cur.rowcount
+
+    def reset_errored_jobs(self, job_type: str) -> int:
+        """Reset terminally-errored jobs back to 'pending' so a re-run retries them.
+
+        attempts is zeroed so a transient failure gets the full retry budget
+        again; a corrupt image simply re-skips on its next attempt (one attempt
+        via the encode-skip path), so this never loops.
+        """
+        cur = self.conn.execute(
+            "UPDATE jobs SET state = 'pending', attempts = 0, updated_at = ? "
+            "WHERE job_type = ? AND state = 'error'",
             (int(time.time()), job_type),
         )
         self.conn.commit()
@@ -323,7 +406,9 @@ class Store:
         sql = """
             SELECT m.id, m.tg_message_id, m.tg_chat_id, se.display_name AS sender,
                    m.ts, m.reply_to, m.kind,
-                   COALESCE(m.text, tr.text) AS text
+                   COALESCE(m.text, tr.text,
+                     (SELECT c.text FROM captions c JOIN media md ON md.id = c.media_id
+                      WHERE md.message_id = m.id LIMIT 1)) AS text
             FROM search s
             JOIN messages m ON m.id = s.message_id
             LEFT JOIN senders se ON se.id = m.sender_id
@@ -361,7 +446,9 @@ class Store:
             """
             SELECT * FROM (
               SELECT m.id, m.tg_message_id, m.tg_chat_id, se.display_name AS sender,
-                     m.ts, m.reply_to, m.kind, COALESCE(m.text, tr.text) AS text
+                     m.ts, m.reply_to, m.kind, COALESCE(m.text, tr.text,
+                     (SELECT c.text FROM captions c JOIN media md ON md.id = c.media_id
+                      WHERE md.message_id = m.id LIMIT 1)) AS text
               FROM messages m LEFT JOIN senders se ON se.id = m.sender_id
               LEFT JOIN transcripts tr ON tr.message_id = m.id
               WHERE m.tg_chat_id = ? AND m.ts <= ? ORDER BY m.ts DESC LIMIT ?
@@ -369,7 +456,9 @@ class Store:
             UNION
             SELECT * FROM (
               SELECT m.id, m.tg_message_id, m.tg_chat_id, se.display_name AS sender,
-                     m.ts, m.reply_to, m.kind, COALESCE(m.text, tr.text) AS text
+                     m.ts, m.reply_to, m.kind, COALESCE(m.text, tr.text,
+                     (SELECT c.text FROM captions c JOIN media md ON md.id = c.media_id
+                      WHERE md.message_id = m.id LIMIT 1)) AS text
               FROM messages m LEFT JOIN senders se ON se.id = m.sender_id
               LEFT JOIN transcripts tr ON tr.message_id = m.id
               WHERE m.tg_chat_id = ? AND m.ts > ? ORDER BY m.ts ASC LIMIT ?
@@ -385,7 +474,9 @@ class Store:
         rows = self.conn.execute(
             """
             SELECT m.id, m.tg_message_id, m.tg_chat_id, se.display_name AS sender,
-                   m.ts, m.reply_to, m.kind, COALESCE(m.text, tr.text) AS text
+                   m.ts, m.reply_to, m.kind, COALESCE(m.text, tr.text,
+                     (SELECT c.text FROM captions c JOIN media md ON md.id = c.media_id
+                      WHERE md.message_id = m.id LIMIT 1)) AS text
             FROM messages m LEFT JOIN senders se ON se.id = m.sender_id
             LEFT JOIN transcripts tr ON tr.message_id = m.id
             WHERE m.tg_chat_id = ? AND m.ts >= ?

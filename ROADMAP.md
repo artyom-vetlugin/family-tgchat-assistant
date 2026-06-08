@@ -44,8 +44,8 @@ Telegram Bot (aiogram 3.x, long polling)
         │
 Ingestion pipeline
   text         → store directly                          [M1 ✅]
-  voice/circle → faster-whisper large-v3-turbo (local)   [M2]
-  image        → Haiku vision caption (Batch API)        [M4]
+  voice/circle → faster-whisper large-v3-turbo (local)   [M2 ✅]
+  image        → Haiku vision caption (Batch API)        [M4 ✅]
   video        → ffmpeg audio → whisper (+ keyframes)    [M7]
         │
 Storage — three LLM-Wiki layers
@@ -168,9 +168,29 @@ are never downgraded. 29 new tests.
 **Accept:** full history queryable ("когда мы первый раз говорили про X");
 no duplicates in the live/export overlap window; report printed.
 
-### M4 — Image understanding (Haiku vision + Batch API)
+### M4 — Image understanding (Haiku vision + Batch API) ✅ DONE
 
-**Scope:**
+**Implemented:** `caption.py` — frozen Russian `CAPTION_PROMPT` (byte-stable;
+below Haiku's min cacheable prefix so it won't cache yet — expected),
+`encode_image` (Pillow, ≤1024px long edge, JPEG q80, original untouched),
+`Captioner` (lazy sync Anthropic client) + `CaptionWorker` (thread, same shape
+as TranscriptionWorker). **Caption jobs use `ref_id = media.id`** (transcribe
+uses `messages.id`). Live photos: `bot.ingest_photo()` downloads
+`message.photo[-1]` and the worker captions each immediately with a single
+Haiku call (1–2/day — batch discount not worth a scheduler; user-approved).
+Backfill: `caption_backfill/` CLI submits Batch API chunks of 500, persists
+`jobs.batch_id` → killed runs resume polling instead of re-paying; errored
+results retry via fresh batches until `job_max_attempts`; corrupt images
+skipped without an API call; `--max-batches N` for a cost-capped trial;
+`--retry-errored` revives jobs that exhausted `job_max_attempts` (transient
+API failures retry, corrupt images re-skip).
+`reset_stale_jobs(unbatched_only=True)` keeps the live worker from stealing
+batch-inflight jobs. Captions surface as the message body in all retrieval
+queries (`COALESCE(text, transcript, caption)` + «[фото]» prefix). 14 new tests.
+**To verify on real data:** reconcile actual batch token spend (< $5 target)
+after the first `--max-batches 1` run.
+
+**Original scope:**
 - Caption prompt (Russian, one frozen prompt for caching): short factual
   description + visible text + people/objects/place; output ~1–3 sentences.
 - Backfill: `jobs` of type `caption` for ~2,174 export photos → **Batch API**
@@ -273,7 +293,7 @@ monthly spend visible and within ~$3–10.
 - All data stays local except retrieval slices/images sent to Anthropic for
   answering/captioning (user-accepted tradeoff).
 
-## Current file map (M3)
+## Current file map (M4)
 
 ```
 src/family_assistant/
@@ -281,6 +301,10 @@ src/family_assistant/
 ├── config.py         # pydantic-settings; .env; models, paths, limits
 ├── __main__.py       # python -m family_assistant
 ├── transcribe.py     # M2: Transcriber (faster-whisper) + TranscriptionWorker
+├── caption.py        # M4: CAPTION_PROMPT, encode_image, Captioner + CaptionWorker
+├── caption_backfill/ # M4: Batch API photo captioning CLI (resumable)
+│   ├── runner.py     # enqueue → submit chunks → poll/collect; jobs.batch_id resume
+│   └── __main__.py   # CLI: python -m family_assistant.caption_backfill [--max-batches N] [--retry-errored]
 ├── store/
 │   ├── schema.sql    # full schema incl. M2-M4 tables (media/transcripts/captions/jobs)
 │   └── db.py         # Store: upsert_sender, insert_message, index_text,
@@ -295,6 +319,6 @@ src/family_assistant/
     ├── media.py      # copy export files → media/export/YYYY/MM/, sha256
     ├── runner.py     # dedup-at-insert, media attach, BackfillReport
     └── __main__.py   # CLI: python -m family_assistant.backfill
-tests/                # store/FTS, transcription worker, backfill (43 tests)
+tests/                # store/FTS, transcription, backfill, captioning (67 tests)
 deploy/com.family.tgassistant.plist
 ```

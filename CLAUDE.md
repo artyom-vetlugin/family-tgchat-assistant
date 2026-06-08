@@ -22,6 +22,10 @@ uv sync --python 3.12 --extra dev     # install (uses uv, not pip)
 uv run python -m family_assistant     # run the bot (needs .env — see .env.example)
 uv run python -m family_assistant.backfill [export_dir] [--chat-id ID] [--transcribe]
                                       # one-time history import (M3, idempotent)
+uv run python -m family_assistant.caption_backfill [--max-batches N] [--retry-errored]
+                                      # caption archived photos via Batch API (M4,
+                                      # resumable; --max-batches 1 = cost-capped trial;
+                                      # --retry-errored revives dead jobs, corrupt re-skip)
 uv run pytest                         # all tests
 uv run pytest tests/test_store.py -k trigram   # single test
 ```
@@ -48,6 +52,13 @@ Layer 1; Layer 3 (`schema/wiki_guide.md`) is human-edited rules.
 Media messages are already logged as rows with empty content; later
 milestones attach transcripts/captions via `store.index_text(message_id, text)`,
 which makes them searchable (this path is tested).
+
+Jobs (`jobs` table) drive transcription (M2) and captioning (M4). Watch the
+`ref_id` divergence: `transcribe` jobs use `messages.id`, `caption` jobs use
+`media.id`. Caption jobs submitted to the Batch API carry `jobs.batch_id`;
+the live `CaptionWorker` must recover with
+`reset_stale_jobs("caption", unbatched_only=True)` so it never steals work
+the `caption_backfill` CLI is still polling for.
 
 ## Invariants to preserve
 
