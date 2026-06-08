@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.family.tgdigest</string>
+
+  <!-- Nightly wiki digest (M5): runs once, maintains wiki/, then exits.
+       NOT KeepAlive — this is a one-shot job, unlike the bot. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__UV__</string>
+    <string>run</string>
+    <string>--project</string>
+    <string>__PROJECT_DIR__</string>
+    <string>python</string>
+    <string>-m</string>
+    <string>family_assistant.digest</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__PROJECT_DIR__</string>
+
+  <!-- 03:00 daily. If the Mac is asleep at 03:00, launchd runs the job on the
+       next wake (catch-up is built in: the digest processes every day from the
+       log.md watermark to yesterday, so a missed night self-heals). -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>__PROJECT_DIR__/data/digest.log</string>
+  <key>StandardErrorPath</key>
+  <string>__PROJECT_DIR__/data/digest.log</string>
+</dict>
+</plist>

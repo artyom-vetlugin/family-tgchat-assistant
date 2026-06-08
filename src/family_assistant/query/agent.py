@@ -14,6 +14,7 @@ from anthropic import AsyncAnthropic
 
 from ..config import Settings
 from ..store.db import Store, format_rows
+from ..wiki import Wiki
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +38,11 @@ Guidelines:
 - If the question was sent as a reply to a specific message, that message id
   is given in the user message — start with get_messages_around on it.
 - When citing findings, mention who wrote it and when (date).
+- For summary-type questions ("что обсуждали на прошлой неделе", "что нового у
+  X") consult the wiki first: call list_wiki_index, then read_wiki_page on a
+  relevant people/ or topics/ page, or read log.md for the dated journal. The
+  wiki is a maintained digest of stable facts; fall back to fts_search /
+  recent_window if it lacks the answer.
 - Only ask a clarifying question if retrieval genuinely came up empty.
 - The current date and the user's question follow in the user message.
 """
@@ -94,6 +100,28 @@ TOOLS = [
             "required": ["hours"],
         },
     },
+    {
+        "name": "list_wiki_index",
+        "description": (
+            "List the wiki catalogue: the people/ and topics/ pages that the "
+            "nightly digest maintains, each with a one-line summary. Start here "
+            "for summary or 'what's new' questions."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "read_wiki_page",
+        "description": (
+            "Read a wiki page in full. path is 'people/<name>.md', "
+            "'topics/<topic>.md', or 'log.md' (the dated digest journal — good "
+            "for 'что обсуждали на прошлой неделе')."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "Wiki page path"}},
+            "required": ["path"],
+        },
+    },
 ]
 
 
@@ -107,10 +135,17 @@ def _parse_date(value: str | None) -> int | None:
 
 
 class RetrievalAgent:
-    def __init__(self, client: AsyncAnthropic, settings: Settings, store: Store):
+    def __init__(
+        self,
+        client: AsyncAnthropic,
+        settings: Settings,
+        store: Store,
+        wiki: Wiki | None = None,
+    ):
         self.client = client
         self.settings = settings
         self.store = store
+        self.wiki = wiki or Wiki(settings.wiki_dir, settings.wiki_guide_path)
 
     def _run_tool(self, name: str, tool_input: dict, chat_id: int) -> str:
         if name == "fts_search":
@@ -130,6 +165,14 @@ class RetrievalAgent:
         if name == "recent_window":
             rows = self.store.recent_window(chat_id, hours=int(tool_input["hours"]))
             return format_rows(rows)
+        if name == "list_wiki_index":
+            return self.wiki.read_index()
+        if name == "read_wiki_page":
+            try:
+                content = self.wiki.read_page(tool_input["path"])
+            except ValueError as exc:
+                return f"Ошибка: {exc}"
+            return content if content is not None else "(страница не существует)"
         return f"Unknown tool: {name}"
 
     async def answer(

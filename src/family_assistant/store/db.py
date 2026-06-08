@@ -486,6 +486,33 @@ class Store:
         ).fetchall()
         return [self._to_message_row(r) for r in reversed(rows)]
 
+    def messages_between(
+        self, tg_chat_id: int, start_ts: int, end_ts: int, limit: int = 5000
+    ) -> list[MessageRow]:
+        """Messages in [start_ts, end_ts) chronologically, with resolved text
+        (message text, else transcript, else caption) — the digest's day window."""
+        rows = self.conn.execute(
+            """
+            SELECT m.id, m.tg_message_id, m.tg_chat_id, se.display_name AS sender,
+                   m.ts, m.reply_to, m.kind, COALESCE(m.text, tr.text,
+                     (SELECT c.text FROM captions c JOIN media md ON md.id = c.media_id
+                      WHERE md.message_id = m.id LIMIT 1)) AS text
+            FROM messages m LEFT JOIN senders se ON se.id = m.sender_id
+            LEFT JOIN transcripts tr ON tr.message_id = m.id
+            WHERE m.tg_chat_id = ? AND m.ts >= ? AND m.ts < ?
+            ORDER BY m.ts ASC LIMIT ?
+            """,
+            (tg_chat_id, start_ts, end_ts, limit),
+        ).fetchall()
+        return [self._to_message_row(r) for r in rows]
+
+    def first_message_date(self, tg_chat_id: int) -> int | None:
+        row = self.conn.execute(
+            "SELECT MIN(ts) AS first_ts FROM messages WHERE tg_chat_id = ?",
+            (tg_chat_id,),
+        ).fetchone()
+        return row["first_ts"] if row and row["first_ts"] is not None else None
+
     def stats(self) -> dict:
         row = self.conn.execute(
             "SELECT COUNT(*) AS n, MIN(ts) AS first_ts, MAX(ts) AS last_ts FROM messages"

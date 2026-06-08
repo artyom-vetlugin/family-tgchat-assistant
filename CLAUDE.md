@@ -26,6 +26,10 @@ uv run python -m family_assistant.caption_backfill [--max-batches N] [--retry-er
                                       # caption archived photos via Batch API (M4,
                                       # resumable; --max-batches 1 = cost-capped trial;
                                       # --retry-errored revives dead jobs, corrupt re-skip)
+uv run python -m family_assistant.digest [--date YYYY-MM-DD] [--rebuild]
+                                      # nightly wiki digest (M5); default = catch up the
+                                      # log.md watermark → yesterday; --rebuild re-seeds
+                                      # all history month by month (deterministic)
 uv run pytest                         # all tests
 uv run pytest tests/test_store.py -k trigram   # single test
 ```
@@ -43,9 +47,19 @@ Sonnet tool-use loop (max 6 iterations, then a forced no-tools final answer)
 over retrieval tools backed by `store/db.py`.
 
 Storage follows the LLM-Wiki three-layer pattern: Layer 1 is the immutable
-SQLite archive + `media/` files (the only layer that exists yet); Layer 2
-(`wiki/` markdown, planned M5) is LLM-maintained and fully rebuildable from
-Layer 1; Layer 3 (`schema/wiki_guide.md`) is human-edited rules.
+SQLite archive + `media/` files; Layer 2 (`wiki/` markdown, M5) is LLM-maintained
+by the nightly digest and fully rebuildable from Layer 1 (`wiki.py` does the
+path-validated I/O); Layer 3 (`schema/wiki_guide.md`) is human-edited rules.
+
+The digest (`digest/runner.py`, `python -m family_assistant.digest`) is a sync
+Haiku tool-loop that edits wiki pages. Two M5 design choices to preserve:
+`index.md` is **auto-generated** from each page's first line (never hand-edited
+by the LLM — keeps it deterministic), and the digest **watermark is derived from
+`log.md`** (last `## YYYY-MM-DD` heading), not a table — so the wiki stays
+self-describing and rebuildable. Cache layout: guide (frozen) → start-of-period
+`index.md` snapshot (breakpoint) → period messages in the user turn. `--rebuild`
+seeds history with sequential **monthly** passes (not Batch API: each month
+builds on the prior month's pages).
 
 `store/schema.sql` already contains the tables for future milestones
 (`media`, `transcripts`, `captions`, `jobs`) — fill them in, don't migrate.

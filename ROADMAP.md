@@ -51,17 +51,17 @@ Ingestion pipeline
 Storage — three LLM-Wiki layers
   Layer 1: SQLite (WAL) + FTS5 trigram + media/   ← raw, immutable [M1 ✅]
   Layer 2: wiki/ markdown (index.md, log.md, people/, topics/)
-           ← LLM-maintained, fully rebuildable from Layer 1        [M5]
-  Layer 3: schema/wiki_guide.md ← human-edited maintenance rules   [M5]
+           ← LLM-maintained, fully rebuildable from Layer 1        [M5 ✅]
+  Layer 3: schema/wiki_guide.md ← human-edited maintenance rules   [M5 ✅]
         │
 Query engine [M1 ✅]
   Haiku intent router → search_history | summarize | context_qa → Sonnet agentic loop
                       → generic_llm → direct Sonnet answer
   Agent tools: fts_search, get_messages_around, recent_window      [M1 ✅]
-               read_wiki_page, list_wiki_index                     [M5]
+               read_wiki_page, list_wiki_index                     [M5 ✅]
                semantic_search                                     [M6]
         │
-Nightly digest job (Haiku, launchd timer) → maintains wiki + log.md [M5]
+Nightly digest job (Haiku, launchd timer) → maintains wiki + log.md [M5 ✅]
 Backfill job (one-time) → parses Desktop export result.json        [M3]
 ```
 
@@ -203,9 +203,33 @@ after the first `--max-batches 1` run.
 **Accept:** "найди фото с дачи" returns relevant photo messages (by date/sender
 so user can scroll to them in Telegram); backfill cost reconciled < $5.
 
-### M5 — LLM Wiki layer + nightly digest
+### M5 — LLM Wiki layer + nightly digest ✅ DONE
 
-**Scope:**
+**Implemented:** `wiki.py` — `Wiki` (path-validated Layer 2 I/O under `wiki_dir`:
+`people/`, `topics/`, `log.md`; rejects traversal / non-`.md` / unknown dirs;
+atomic `write_page`; **auto-generated `index.md`** from each page's first line,
+so the catalogue is deterministic and not hand-edited by the LLM). The digest
+**watermark lives in `log.md`** (last `## YYYY-MM-DD` heading) — no extra table,
+wiki stays self-describing and rebuildable. `schema/wiki_guide.md` is the
+human-edited Layer 3 (in git; gitignored `wiki/` is Layer 2). `digest/runner.py`
+— `DigestAgent` (sync Haiku tool-loop: `list_wiki_index` / `read_wiki_page` /
+`write_wiki_page`, bounded by `max_digest_iterations` then a forced no-tools
+final = the journal entry) + `run_digest`. Cache layout per the doc: system =
+guide (frozen) → start-of-period `index.md` snapshot (breakpoint here) →
+period's messages in the user turn; cache hits land on turns 2..N within a
+period. Two modes: daily catch-up (watermark+1 → yesterday; fresh wiki digests
+only yesterday) and `--rebuild` (wipe Layer 2, **sequential monthly** passes
+oldest→newest so each month builds on prior pages — not Batch API, the
+cross-month dependency precludes batching). CLI:
+`python -m family_assistant.digest [--date YYYY-MM-DD] [--rebuild]`. Query loop
+gained `list_wiki_index` / `read_wiki_page` tools (one-time agent prompt-cache
+invalidation, expected). `store.messages_between` is the day window
+(`COALESCE(text, transcript, caption)`). launchd `deploy/com.family.tgdigest.plist`
+(`StartCalendarInterval` 03:00, one-shot, catch-up self-heals missed nights).
+21 new tests. **To verify on real data:** `cache_read_input_tokens > 0` on
+digest turns 2..N after the first `--rebuild` run.
+
+**Original scope:**
 - Directory layout: `wiki/index.md` (catalog of pages, one-line summaries),
   `wiki/log.md` (append-only daily digest journal), `wiki/people/<name>.md`,
   `wiki/topics/<topic>.md`. Fully rebuildable from Layer 1.
@@ -293,7 +317,7 @@ monthly spend visible and within ~$3–10.
 - All data stays local except retrieval slices/images sent to Anthropic for
   answering/captioning (user-accepted tradeoff).
 
-## Current file map (M4)
+## Current file map (M5)
 
 ```
 src/family_assistant/
@@ -305,13 +329,17 @@ src/family_assistant/
 ├── caption_backfill/ # M4: Batch API photo captioning CLI (resumable)
 │   ├── runner.py     # enqueue → submit chunks → poll/collect; jobs.batch_id resume
 │   └── __main__.py   # CLI: python -m family_assistant.caption_backfill [--max-batches N] [--retry-errored]
+├── wiki.py           # M5: Wiki — Layer 2 I/O, path validation, auto-index, log watermark
+├── digest/           # M5: nightly wiki digest
+│   ├── runner.py     # DigestAgent (Haiku tool-loop) + run_digest (daily / monthly seed)
+│   └── __main__.py   # CLI: python -m family_assistant.digest [--date YYYY-MM-DD] [--rebuild]
 ├── store/
 │   ├── schema.sql    # full schema incl. M2-M4 tables (media/transcripts/captions/jobs)
-│   └── db.py         # Store: upsert_sender, insert_message, index_text,
-│                     #        search, get_messages_around, recent_window, stats
+│   └── db.py         # Store: upsert_sender, insert_message, index_text, search,
+│                     #        get_messages_around, recent_window, messages_between, stats
 ├── query/
 │   ├── router.py     # classify_intent (Haiku, structured output)
-│   ├── agent.py      # RetrievalAgent: TOOLS, manual loop, prompt caching,
+│   ├── agent.py      # RetrievalAgent: TOOLS (+wiki tools), manual loop, prompt caching,
 │   │                 #        answer / answer_generic
 │   └── engine.py     # QueryEngine.handle: route → answer
 └── backfill/         # M3: Telegram Desktop export import
@@ -319,6 +347,8 @@ src/family_assistant/
     ├── media.py      # copy export files → media/export/YYYY/MM/, sha256
     ├── runner.py     # dedup-at-insert, media attach, BackfillReport
     └── __main__.py   # CLI: python -m family_assistant.backfill
-tests/                # store/FTS, transcription, backfill, captioning (67 tests)
-deploy/com.family.tgassistant.plist
+schema/wiki_guide.md  # M5: Layer 3 — human-edited wiki maintenance rules (in git)
+tests/                # store/FTS, transcription, backfill, captioning, wiki, digest (88 tests)
+deploy/com.family.tgassistant.plist   # bot (KeepAlive)
+deploy/com.family.tgdigest.plist      # M5: nightly digest (StartCalendarInterval 03:00)
 ```

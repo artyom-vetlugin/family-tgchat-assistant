@@ -52,6 +52,33 @@ def test_russian_trigram_search(store):
     assert [r.tg_message_id for r in rows] == [2]
 
 
+def test_messages_between_window_and_resolution(store):
+    day = int(time.mktime(time.strptime("2024-05-10", "%Y-%m-%d")))
+    add_message(store, msg_id=1, text="до окна", ts=day - 1)
+    add_message(store, msg_id=2, text="внутри окна", ts=day + 100)
+    # a photo whose searchable text lives in captions, not messages.text
+    sender_id = store.upsert_sender(7, "Папа")
+    pid = store.insert_message(
+        tg_message_id=3, tg_chat_id=-100, sender_id=sender_id,
+        ts=day + 200, kind="photo", text=None,
+    )
+    media_id = store.insert_media(message_id=pid, kind="photo", rel_path="x.jpg")
+    store.insert_caption(media_id=media_id, text="дети на даче", model="m")
+    add_message(store, msg_id=4, text="после окна", ts=day + 86400)
+
+    rows = store.messages_between(-100, day, day + 86400)  # [day, next day)
+    assert [r.tg_message_id for r in rows] == [2, 3]
+    photo = next(r for r in rows if r.tg_message_id == 3)
+    assert photo.text == "дети на даче"  # caption resolved via COALESCE
+
+
+def test_first_message_date(store):
+    assert store.first_message_date(-100) is None
+    add_message(store, msg_id=1, text="второе", ts=200)
+    add_message(store, msg_id=2, text="первое", ts=100)
+    assert store.first_message_date(-100) == 100
+
+
 def test_search_too_short_query_is_safe(store):
     add_message(store, msg_id=1, text="привет")
     assert store.search("пр") == []  # <3 chars for trigram — no crash

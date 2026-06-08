@@ -14,8 +14,10 @@ milestones) and answers questions about the chat using the Claude API.
   $0) and searchable; resumable job queue
 - ✅ M3: full history imported from a Telegram Desktop export (dedup against
   live messages, media copied, voice backlog transcribed locally)
-- ⏳ M4 image captions · M5 LLM wiki + nightly digest ·
-  M6 semantic search · M7 video & polish
+- ✅ M4: photos captioned (Haiku vision; live worker + resumable Batch-API backfill)
+- ✅ M5: LLM wiki (`wiki/`) maintained by a nightly Haiku digest; the answer
+  agent reads it (`list_wiki_index` / `read_wiki_page`)
+- ⏳ M6 semantic search · M7 video & polish
 
 > **Full scope, architecture, design decisions and per-milestone acceptance
 > criteria live in [ROADMAP.md](ROADMAP.md)** — read that first when resuming
@@ -67,6 +69,25 @@ which media types you tick, and you can import in stages — re-running with a
 fuller export (wider date range, more media types) adds the older messages
 and fills in previously missing media files in place.
 
+## Wiki digest (M5)
+
+The nightly digest reads each day's messages (texts, transcripts, captions) and
+maintains a small LLM-kept wiki under `wiki/` — `people/`, `topics/`, an
+append-only `log.md` journal, and an auto-generated `index.md`. The answer agent
+consults it first for "что обсуждали на прошлой неделе" / "что нового у X". The
+wiki is fully rebuildable from the SQLite archive, so `wiki/` is gitignored;
+only the human-edited rules (`schema/wiki_guide.md`, Layer 3) are in git.
+
+```bash
+uv run python -m family_assistant.digest             # catch up to yesterday (daily)
+uv run python -m family_assistant.digest --rebuild   # seed all history (month by month)
+uv run python -m family_assistant.digest --date 2024-05-10   # (re)digest one day
+```
+
+Run it without `--rebuild` first only after seeding history once with
+`--rebuild` (a fresh wiki otherwise digests just yesterday). It uses Haiku and
+prompt caching; the cost is roughly one Haiku pass per day.
+
 ## Run as a service (launchd, auto-start + keepalive)
 
 ```bash
@@ -76,6 +97,21 @@ launchctl load ~/Library/LaunchAgents/com.family.tgassistant.plist
 # logs:
 tail -f data/bot.log
 ```
+
+The nightly digest runs as a second launchd job (one-shot at 03:00, not
+KeepAlive):
+
+```bash
+sed "s|__PROJECT_DIR__|$(pwd)|g; s|__UV__|$(which uv)|g" deploy/com.family.tgdigest.plist \
+  > ~/Library/LaunchAgents/com.family.tgdigest.plist
+launchctl load ~/Library/LaunchAgents/com.family.tgdigest.plist
+tail -f data/digest.log
+```
+
+If the Mac is asleep at 03:00, launchd runs the digest on the next wake; missed
+nights self-heal because the digest catches up from the `log.md` watermark to
+yesterday. To run reliably overnight, schedule a wake with e.g.
+`sudo pmset repeat wakeorpoweron MTWRFSU 02:55:00`.
 
 Note: when the Mac sleeps, Telegram holds undelivered updates for ~24h and the
 bot catches up on wake: the backlog is archived (and voice transcribed), but

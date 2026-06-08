@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     media_dir: Path = PROJECT_ROOT / "media"
     # Default location of the Telegram Desktop export (M3 backfill)
     export_dir: Path = PROJECT_ROOT / "export"
+    # LLM Wiki (M5): Layer 2 (rebuildable, gitignored) and Layer 3 (human-edited)
+    wiki_dir: Path = PROJECT_ROOT / "wiki"
+    wiki_guide_path: Path = PROJECT_ROOT / "schema" / "wiki_guide.md"
 
     # Query engine
     max_agent_iterations: int = 6
@@ -52,6 +55,13 @@ class Settings(BaseSettings):
     caption_poll_seconds: int = 30
     caption_resize_long_edge: int = 1024  # resize before sending (token cost ↓)
     caption_jpeg_quality: int = 80
+
+    # Nightly digest / wiki maintenance (M5) — Haiku, never Opus
+    digest_model: str = "claude-haiku-4-5"
+    digest_max_tokens: int = 2048
+    max_digest_iterations: int = 8
+    # Which chat the digest summarises. Empty → first of allowed_chat_ids.
+    digest_chat_id: int | None = None
 
     @property
     def db_path(self) -> Path:
