@@ -30,6 +30,10 @@ uv run python -m family_assistant.digest [--date YYYY-MM-DD] [--rebuild]
                                       # nightly wiki digest (M5); default = catch up the
                                       # log.md watermark → yesterday; --rebuild re-seeds
                                       # all history month by month (deterministic)
+uv run python -m family_assistant.embed_backfill [--limit N] [--retry-errored]
+                                      # local semantic-search embeddings (M6, $0); resumable
+                                      # inline drain over every message with searchable text;
+                                      # --limit N = trial; first run downloads the e5 model
 uv run pytest                         # all tests
 uv run pytest tests/test_store.py -k trigram   # single test
 ```
@@ -62,17 +66,31 @@ seeds history with sequential **monthly** passes (not Batch API: each month
 builds on the prior month's pages).
 
 `store/schema.sql` already contains the tables for future milestones
-(`media`, `transcripts`, `captions`, `jobs`) — fill them in, don't migrate.
+(`media`, `transcripts`, `captions`, `jobs`; `embeddings` was added in M6) —
+fill them in, don't migrate (schema is re-applied idempotently with
+`CREATE … IF NOT EXISTS` on every `Store.__init__`, so a brand-new table just
+appears on next start).
 Media messages are already logged as rows with empty content; later
 milestones attach transcripts/captions via `store.index_text(message_id, text)`,
 which makes them searchable (this path is tested).
 
-Jobs (`jobs` table) drive transcription (M2) and captioning (M4). Watch the
-`ref_id` divergence: `transcribe` jobs use `messages.id`, `caption` jobs use
-`media.id`. Caption jobs submitted to the Batch API carry `jobs.batch_id`;
-the live `CaptionWorker` must recover with
+Jobs (`jobs` table) drive transcription (M2), captioning (M4) and embedding
+(M6). Watch the `ref_id` divergence: `transcribe` and `embed` jobs use
+`messages.id`, `caption` jobs use `media.id`. Caption jobs submitted to the
+Batch API carry `jobs.batch_id`; the live `CaptionWorker` must recover with
 `reset_stale_jobs("caption", unbatched_only=True)` so it never steals work
 the `caption_backfill` CLI is still polling for.
+
+Semantic search (M6, `embed.py`): a local sentence-transformers worker
+(`EmbeddingWorker`, same thread+WAL shape as the others) embeds each message's
+`text_for_message` (the COALESCE of text/transcript/caption) into the
+`embeddings` table — one float32 BLOB per ~512-token chunk. `embed` jobs are
+enqueued at the three `index_text` chokepoints (text in `bot.log_message`; voice
+/photo via an `embed_enqueue` hook on the transcribe/caption workers, since their
+text lands later). `store.knn` does brute-force numpy cosine kNN ($0, no
+sqlite-vec); the `semantic_search` agent tool shares **one** `Embedder` instance
+(threaded `BotApp → QueryEngine → RetrievalAgent`, also given to the worker).
+Backfill via `embed_backfill` (local inline drain, no Batch API).
 
 ## Invariants to preserve
 

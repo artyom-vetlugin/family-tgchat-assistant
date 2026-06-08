@@ -18,6 +18,7 @@ from aiogram.types import Message
 
 from .caption import CaptionWorker
 from .config import Settings
+from .embed import Embedder, EmbeddingWorker
 from .query import QueryEngine
 from .store import Store
 from .transcribe import TranscriptionWorker
@@ -78,7 +79,10 @@ class BotApp:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.store = Store(settings.db_path)
-        self.engine = QueryEngine(settings, self.store)
+        # One embedding model shared by the query path and the embed worker
+        # (avoids loading e5 into memory twice).
+        self.embedder = Embedder(settings)
+        self.engine = QueryEngine(settings, self.store, embedder=self.embedder)
         self.bot = Bot(
             token=settings.telegram_bot_token,
             default=DefaultBotProperties(parse_mode=None),
@@ -87,11 +91,18 @@ class BotApp:
         self.dp.include_router(router)
         self.dp["app"] = self
         self.bot_username: str | None = None
+        self.embedding_worker = EmbeddingWorker(
+            settings.db_path, settings, self.embedder
+        )
+        # Voice/photo messages get their searchable text only after transcription
+        # /captioning, so those workers enqueue the embed job at that point.
         self.worker = TranscriptionWorker(
-            settings.db_path, settings.media_dir, settings
+            settings.db_path, settings.media_dir, settings,
+            embed_enqueue=self.embedding_worker.enqueue,
         )
         self.caption_worker = CaptionWorker(
-            settings.db_path, settings.media_dir, settings
+            settings.db_path, settings.media_dir, settings,
+            embed_enqueue=self.embedding_worker.enqueue,
         )
 
     def chat_allowed(self, chat_id: int) -> bool:
@@ -117,6 +128,10 @@ class BotApp:
         )
         if row_id and text:
             self.store.index_text(row_id, text)
+            # Embed text messages now; voice/photo are embedded after their
+            # transcript/caption lands (handled by those workers).
+            job_id = self.store.create_job(job_type="embed", ref_id=row_id)
+            self.embedding_worker.enqueue(job_id)
         return row_id
 
     async def ingest_media(self, message: Message, row_id: int) -> None:
@@ -203,11 +218,13 @@ class BotApp:
             log.warning(warning)
         self.worker.start()  # recovers unfinished transcription jobs
         self.caption_worker.start()  # recovers unfinished (non-batch) caption jobs
+        self.embedding_worker.start()  # recovers unfinished embed jobs
         try:
             await self.dp.start_polling(self.bot)
         finally:
             self.worker.stop()
             self.caption_worker.stop()
+            self.embedding_worker.stop()
 
 
 @router.message(Command("id"))

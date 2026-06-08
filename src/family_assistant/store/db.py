@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
+
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 
@@ -157,6 +159,23 @@ class Store:
             (tg_chat_id, ts),
         ).fetchall()
         return [(r["id"], r["text"]) for r in rows]
+
+    def text_for_message(self, message_id: int) -> str | None:
+        """The searchable text for one message: message text, else transcript,
+        else caption (same COALESCE source as the retrieval tools) — what the
+        embedding worker turns into vectors."""
+        row = self.conn.execute(
+            """
+            SELECT COALESCE(m.text, tr.text,
+                     (SELECT c.text FROM captions c JOIN media md ON md.id = c.media_id
+                      WHERE md.message_id = m.id LIMIT 1)) AS text
+            FROM messages m
+            LEFT JOIN transcripts tr ON tr.message_id = m.id
+            WHERE m.id = ?
+            """,
+            (message_id,),
+        ).fetchone()
+        return row["text"] if row else None
 
     def index_text(self, message_id: int, body: str) -> None:
         """Add searchable text (message text, transcript, or caption) to FTS."""
@@ -388,6 +407,118 @@ class Store:
         )
         self.conn.commit()
         return cur.rowcount
+
+    # --- embeddings (M6 semantic search) ------------------------------------
+
+    def replace_embeddings(
+        self, message_id: int, vectors: np.ndarray, *, model: str, dim: int
+    ) -> None:
+        """Store one vector per chunk for a message, replacing any existing ones
+        for this model (re-embedding is idempotent). `vectors` is (n_chunks, dim),
+        L2-normalized float32."""
+        self.conn.execute(
+            "DELETE FROM embeddings WHERE message_id = ? AND model = ?",
+            (message_id, model),
+        )
+        now = int(time.time())
+        rows = [
+            (message_id, i, vec.astype(np.float32).tobytes(), model, dim, now)
+            for i, vec in enumerate(vectors)
+        ]
+        self.conn.executemany(
+            """
+            INSERT INTO embeddings (message_id, chunk_index, vector, model, dim, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        self.conn.commit()
+
+    def messages_needing_embedding(self, model: str) -> list[int]:
+        """Message ids that have searchable text but no embedding for `model` —
+        the backfill enqueue source (resumable: re-runs skip embedded rows)."""
+        rows = self.conn.execute(
+            """
+            SELECT m.id FROM messages m
+            LEFT JOIN transcripts tr ON tr.message_id = m.id
+            WHERE COALESCE(m.text, tr.text,
+                    (SELECT c.text FROM captions c JOIN media md ON md.id = c.media_id
+                     WHERE md.message_id = m.id LIMIT 1)) IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM embeddings e
+                WHERE e.message_id = m.id AND e.model = ?
+              )
+            ORDER BY m.id
+            """,
+            (model,),
+        ).fetchall()
+        return [r["id"] for r in rows]
+
+    def knn(
+        self,
+        query_vec: np.ndarray,
+        *,
+        model: str,
+        k: int = 10,
+        sender: str | None = None,
+        after_ts: int | None = None,
+        before_ts: int | None = None,
+    ) -> list[MessageRow]:
+        """Brute-force cosine kNN over stored vectors (query_vec L2-normalized).
+
+        Loads the candidate vectors (optionally filtered by sender/time), scores
+        them with a single matmul, dedups chunks back to their message keeping the
+        best score, and returns the top-k as MessageRows — same shape as `search`."""
+        sql = """
+            SELECT e.message_id, e.vector
+            FROM embeddings e
+            JOIN messages m ON m.id = e.message_id
+            LEFT JOIN senders se ON se.id = m.sender_id
+            WHERE e.model = ?
+        """
+        params: list = [model]
+        if sender:
+            sql += " AND se.display_name LIKE ?"
+            params.append(f"%{sender}%")
+        if after_ts:
+            sql += " AND m.ts >= ?"
+            params.append(after_ts)
+        if before_ts:
+            sql += " AND m.ts <= ?"
+            params.append(before_ts)
+        rows = self.conn.execute(sql, params).fetchall()
+        if not rows:
+            return []
+
+        matrix = np.frombuffer(
+            b"".join(r["vector"] for r in rows), dtype=np.float32
+        ).reshape(len(rows), -1)
+        scores = matrix @ query_vec.astype(np.float32)
+
+        best: dict[int, float] = {}
+        for r, score in zip(rows, scores):
+            mid = r["message_id"]
+            if score > best.get(mid, -np.inf):
+                best[mid] = float(score)
+        top_ids = sorted(best, key=lambda mid: best[mid], reverse=True)[:k]
+        if not top_ids:
+            return []
+
+        placeholders = ",".join("?" for _ in top_ids)
+        fetched = self.conn.execute(
+            f"""
+            SELECT m.id, m.tg_message_id, m.tg_chat_id, se.display_name AS sender,
+                   m.ts, m.reply_to, m.kind, COALESCE(m.text, tr.text,
+                     (SELECT c.text FROM captions c JOIN media md ON md.id = c.media_id
+                      WHERE md.message_id = m.id LIMIT 1)) AS text
+            FROM messages m LEFT JOIN senders se ON se.id = m.sender_id
+            LEFT JOIN transcripts tr ON tr.message_id = m.id
+            WHERE m.id IN ({placeholders})
+            """,
+            top_ids,
+        ).fetchall()
+        by_id = {r["id"]: self._to_message_row(r) for r in fetched}
+        return [by_id[mid] for mid in top_ids if mid in by_id]
 
     # --- retrieval (query-engine tools) -------------------------------------
 

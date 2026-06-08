@@ -63,6 +63,15 @@ class Settings(BaseSettings):
     # Which chat the digest summarises. Empty → first of allowed_chat_ids.
     digest_chat_id: int | None = None
 
+    # Semantic search (M6) — local sentence-transformers, $0 (CPU on Apple Silicon).
+    # e5 wants `query: ` / `passage: ` prefixes; embeddings are L2-normalized so
+    # cosine == dot product. Weights cache under models_dir (shared with whisper).
+    embedding_model: str = "intfloat/multilingual-e5-small"
+    embedding_device: str = "cpu"
+    embedding_dim: int = 384
+    embedding_chunk_chars: int = 1800  # ~512 tokens (Russian); longer texts split
+    semantic_search_k: int = 10
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "chat.db"

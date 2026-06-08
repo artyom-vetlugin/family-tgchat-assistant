@@ -15,6 +15,7 @@ import io
 import logging
 import queue
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 from .config import Settings
@@ -120,11 +121,14 @@ class CaptionWorker:
         media_dir: Path,
         settings: Settings,
         captioner: Captioner | None = None,
+        embed_enqueue: Callable[[int], None] | None = None,
     ):
         self.db_path = db_path
         self.media_dir = media_dir
         self.settings = settings
         self.captioner = captioner or Captioner(settings)
+        # Hook to enqueue a follow-on embed job once the caption is indexed (M6).
+        self.embed_enqueue = embed_enqueue
         self.queue: queue.Queue[int] = queue.Queue()
         self._thread: threading.Thread | None = None
 
@@ -139,6 +143,13 @@ class CaptionWorker:
 
     def enqueue(self, job_id: int) -> None:
         self.queue.put(job_id)
+
+    def _enqueue_embed(self, store: Store, message_id: int) -> None:
+        """Queue an embed job for the freshly-captioned message (M6)."""
+        if self.embed_enqueue is None:
+            return
+        job_id = store.create_job(job_type="embed", ref_id=message_id)
+        self.embed_enqueue(job_id)
 
     # --- worker thread -------------------------------------------------------
 
@@ -181,6 +192,7 @@ class CaptionWorker:
                     media_id=media_id, text=text, model=self.captioner.model
                 )
                 store.index_text(message_id, text)
+                self._enqueue_embed(store, message_id)
             store.finish_job(job_id, ok=True, max_attempts=self.settings.job_max_attempts)
             log.info("captioned media %s (%d chars)", media_id, len(text))
         except Exception:

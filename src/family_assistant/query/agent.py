@@ -13,6 +13,7 @@ from datetime import datetime
 from anthropic import AsyncAnthropic
 
 from ..config import Settings
+from ..embed import Embedder
 from ..store.db import Store, format_rows
 from ..wiki import Wiki
 
@@ -30,6 +31,11 @@ Guidelines:
 - Use the tools to ground answers in the actual chat history. Re-run
   fts_search with different word forms (Russian morphology: "поехали",
   "поехать", "поездка") and synonyms if the first search misses.
+- fts_search matches exact substrings — use it first for specific words,
+  names and quotes. semantic_search matches by meaning, not wording — use it
+  for paraphrased or conceptual questions ("когда говорили о здоровье" finds
+  "болит голова") and whenever fts_search with different word forms still
+  comes up empty.
 - ALWAYS retrieve before answering or asking for clarification. If the
   question is vague or refers to "сообщение"/"голосовое"/"что он сказал"
   without specifics, call recent_window (24-48h) first — the person almost
@@ -122,6 +128,27 @@ TOOLS = [
             "required": ["path"],
         },
     },
+    {
+        "name": "semantic_search",
+        "description": (
+            "Semantic (meaning-based) search over the chat archive using local "
+            "embeddings. Unlike fts_search it matches paraphrases and concepts, "
+            "not exact words: 'о здоровье' can surface 'болит голова'. Use it for "
+            "fuzzy/conceptual questions or when fts_search keeps coming up empty. "
+            "No minimum length."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query (Russian); a phrase or concept works best"},
+                "k": {"type": "integer", "description": "Number of results, default 10"},
+                "sender": {"type": "string", "description": "Filter by sender name (substring)"},
+                "after": {"type": "string", "description": "Only messages on/after this date, ISO format YYYY-MM-DD"},
+                "before": {"type": "string", "description": "Only messages on/before this date, ISO format YYYY-MM-DD"},
+            },
+            "required": ["query"],
+        },
+    },
 ]
 
 
@@ -141,11 +168,13 @@ class RetrievalAgent:
         settings: Settings,
         store: Store,
         wiki: Wiki | None = None,
+        embedder: Embedder | None = None,
     ):
         self.client = client
         self.settings = settings
         self.store = store
         self.wiki = wiki or Wiki(settings.wiki_dir, settings.wiki_guide_path)
+        self.embedder = embedder or Embedder(settings)
 
     def _run_tool(self, name: str, tool_input: dict, chat_id: int) -> str:
         if name == "fts_search":
@@ -164,6 +193,17 @@ class RetrievalAgent:
             return format_rows(rows)
         if name == "recent_window":
             rows = self.store.recent_window(chat_id, hours=int(tool_input["hours"]))
+            return format_rows(rows)
+        if name == "semantic_search":
+            query_vec = self.embedder.encode_query(tool_input["query"])
+            rows = self.store.knn(
+                query_vec,
+                model=self.embedder.model_name,
+                k=int(tool_input.get("k", self.settings.semantic_search_k)),
+                sender=tool_input.get("sender"),
+                after_ts=_parse_date(tool_input.get("after")),
+                before_ts=_parse_date(tool_input.get("before")),
+            )
             return format_rows(rows)
         if name == "list_wiki_index":
             return self.wiki.read_index()

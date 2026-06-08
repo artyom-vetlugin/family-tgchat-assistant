@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 from .config import Settings
@@ -62,11 +63,15 @@ class TranscriptionWorker:
         media_dir: Path,
         settings: Settings,
         transcriber: Transcriber | None = None,
+        embed_enqueue: Callable[[int], None] | None = None,
     ):
         self.db_path = db_path
         self.media_dir = media_dir
         self.settings = settings
         self.transcriber = transcriber or Transcriber(settings)
+        # Hook to enqueue a follow-on embed job once the transcript is indexed
+        # (M6); None when running standalone (e.g. backfill --transcribe).
+        self.embed_enqueue = embed_enqueue
         self.queue: queue.Queue[int] = queue.Queue()
         self._thread: threading.Thread | None = None
 
@@ -81,6 +86,13 @@ class TranscriptionWorker:
 
     def enqueue(self, job_id: int) -> None:
         self.queue.put(job_id)
+
+    def _enqueue_embed(self, store: Store, message_id: int) -> None:
+        """Queue an embed job for the freshly-transcribed message (M6)."""
+        if self.embed_enqueue is None:
+            return
+        job_id = store.create_job(job_type="embed", ref_id=message_id)
+        self.embed_enqueue(job_id)
 
     def process(self, store: Store, job_id: int) -> None:
         """Run one job synchronously on the caller's connection (backfill --transcribe)."""
@@ -127,6 +139,7 @@ class TranscriptionWorker:
                     lang=self.settings.whisper_lang,
                 )
                 store.index_text(message_id, text)
+                self._enqueue_embed(store, message_id)
             state = store.finish_job(job_id, ok=True, max_attempts=self.settings.job_max_attempts)
             log.info("transcribed message %s (%d chars)", message_id, len(text))
         except Exception:

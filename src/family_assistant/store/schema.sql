@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS captions (
 
 CREATE TABLE IF NOT EXISTS jobs (
   id         INTEGER PRIMARY KEY,
-  job_type   TEXT NOT NULL,                 -- caption|transcribe|video
+  job_type   TEXT NOT NULL,                 -- caption|transcribe|video|embed
   ref_id     INTEGER NOT NULL,              -- media.id or messages.id depending on job_type
   state      TEXT NOT NULL DEFAULT 'pending',  -- pending|inflight|done|error
   batch_id   TEXT,                          -- Anthropic Batch API id
@@ -72,3 +72,20 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(
   sender UNINDEXED,
   tokenize = 'trigram'
 );
+
+-- Semantic search vectors (M6) — local sentence-transformer embeddings.
+-- One row per chunk (long transcripts split into ~512-token chunks); short
+-- messages get a single chunk_index=0 row. Derived from Layer 1 / FTS text,
+-- fully rebuildable by `python -m family_assistant.embed_backfill`. The `model`
+-- in the UNIQUE key lets a model change re-embed without colliding.
+CREATE TABLE IF NOT EXISTS embeddings (
+  id          INTEGER PRIMARY KEY,
+  message_id  INTEGER NOT NULL REFERENCES messages(id),
+  chunk_index INTEGER NOT NULL DEFAULT 0,
+  vector      BLOB NOT NULL,     -- float32 little-endian, L2-normalized, `dim` floats
+  model       TEXT NOT NULL,
+  dim         INTEGER NOT NULL,
+  created_at  INTEGER,
+  UNIQUE(message_id, chunk_index, model)
+);
+CREATE INDEX IF NOT EXISTS idx_embeddings_message ON embeddings(message_id);

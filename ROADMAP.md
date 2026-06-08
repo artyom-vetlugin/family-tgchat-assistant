@@ -46,6 +46,7 @@ Ingestion pipeline
   text         → store directly                          [M1 ✅]
   voice/circle → faster-whisper large-v3-turbo (local)   [M2 ✅]
   image        → Haiku vision caption (Batch API)        [M4 ✅]
+  text/voice/image → e5 local embeddings (semantic search) [M6 ✅]
   video        → ffmpeg audio → whisper (+ keyframes)    [M7]
         │
 Storage — three LLM-Wiki layers
@@ -59,7 +60,7 @@ Query engine [M1 ✅]
                       → generic_llm → direct Sonnet answer
   Agent tools: fts_search, get_messages_around, recent_window      [M1 ✅]
                read_wiki_page, list_wiki_index                     [M5 ✅]
-               semantic_search                                     [M6]
+               semantic_search                                     [M6 ✅]
         │
 Nightly digest job (Haiku, launchd timer) → maintains wiki + log.md [M5 ✅]
 Backfill job (one-time) → parses Desktop export result.json        [M3]
@@ -251,9 +252,37 @@ digest turns 2..N after the first `--rebuild` run.
 pages; one digest call/day with verified cache hits
 (`cache_read_input_tokens > 0`); wiki regenerates from scratch deterministically.
 
-### M6 — Semantic search (local embeddings, $0)
+### M6 — Semantic search (local embeddings, $0) ✅ DONE
 
-**Scope:**
+**Implemented:** `embed.py` — `chunk_text` (whitespace-boundary split at
+`embedding_chunk_chars`≈512 tokens; short messages → one chunk), `Embedder`
+(lazy `sentence-transformers` `intfloat/multilingual-e5-small`, 384-dim, e5
+`query: `/`passage: ` prefixes, L2-normalized so cosine == dot product; weights
+cache under `models_dir`) + `EmbeddingWorker` (dedicated thread + own WAL
+connection, same shape as TranscriptionWorker; `embed` jobs use
+`ref_id = messages.id`). New `embeddings` table (one row per chunk, vector as
+float32 BLOB, `UNIQUE(message_id, chunk_index, model)` so a model change
+re-embeds without collision) — added to `schema.sql`, auto-created on startup
+(no migration). Store gained `text_for_message`, `replace_embeddings`
+(idempotent — DELETE-then-insert), `messages_needing_embedding` and `knn`
+(brute-force numpy cosine kNN: load candidate vectors with optional sender/time
+filters → single matmul → dedup chunks to best per message → top-k MessageRows,
+`format_rows`-identical to `fts_search`). `semantic_search` tool appended to the
+agent's `TOOLS` (one-time prompt-cache invalidation, expected) with frozen
+AGENT_SYSTEM guidance (fts first for exact words, semantic for paraphrase/concept
+or when fts comes up empty); one shared `Embedder` is threaded from `BotApp`
+through `QueryEngine` into the agent and the worker (model loaded once). Live
+ingest enqueues `embed` jobs at the three `index_text` chokepoints: text messages
+in `bot.log_message`, and after a transcript/caption via an injected
+`embed_enqueue` hook on the transcription/caption workers; startup `recover`
+self-heals. CLI `embed_backfill/` (`python -m family_assistant.embed_backfill
+[--limit N] [--retry-errored]`) — resumable inline drain ($0, no Batch API; the
+cross-model/per-message dedup makes re-runs skip done work). 16 new tests with a
+`FakeEmbedder` (no real model in CI). **Verified on real data:** real e5 ranks a
+paraphrase query ("вопросы здоровья" → "болит голова"/"к врачу") above unrelated
+messages; `--limit 50` trial embedded 50/50, 0 errored, 384-dim/1536-byte vectors.
+
+**Original scope:**
 - `sentence-transformers` + `intfloat/multilingual-e5-small` (good Russian,
   small, fast on M-series CPU). Remember e5 conventions: prefix `query: ` /
   `passage: ` on encode.
@@ -317,7 +346,7 @@ monthly spend visible and within ~$3–10.
 - All data stays local except retrieval slices/images sent to Anthropic for
   answering/captioning (user-accepted tradeoff).
 
-## Current file map (M5)
+## Current file map (M6)
 
 ```
 src/family_assistant/
@@ -329,26 +358,31 @@ src/family_assistant/
 ├── caption_backfill/ # M4: Batch API photo captioning CLI (resumable)
 │   ├── runner.py     # enqueue → submit chunks → poll/collect; jobs.batch_id resume
 │   └── __main__.py   # CLI: python -m family_assistant.caption_backfill [--max-batches N] [--retry-errored]
+├── embed.py          # M6: chunk_text, Embedder (e5, sentence-transformers) + EmbeddingWorker
+├── embed_backfill/   # M6: local embedding backfill CLI (resumable, $0)
+│   ├── runner.py     # enqueue → inline drain; report; per-model/message dedup
+│   └── __main__.py   # CLI: python -m family_assistant.embed_backfill [--limit N] [--retry-errored]
 ├── wiki.py           # M5: Wiki — Layer 2 I/O, path validation, auto-index, log watermark
 ├── digest/           # M5: nightly wiki digest
 │   ├── runner.py     # DigestAgent (Haiku tool-loop) + run_digest (daily / monthly seed)
 │   └── __main__.py   # CLI: python -m family_assistant.digest [--date YYYY-MM-DD] [--rebuild]
 ├── store/
-│   ├── schema.sql    # full schema incl. M2-M4 tables (media/transcripts/captions/jobs)
+│   ├── schema.sql    # full schema incl. M2-M6 tables (media/transcripts/captions/jobs/embeddings)
 │   └── db.py         # Store: upsert_sender, insert_message, index_text, search,
-│                     #        get_messages_around, recent_window, messages_between, stats
+│                     #        get_messages_around, recent_window, messages_between, stats,
+│                     #        text_for_message, replace_embeddings, messages_needing_embedding, knn
 ├── query/
 │   ├── router.py     # classify_intent (Haiku, structured output)
-│   ├── agent.py      # RetrievalAgent: TOOLS (+wiki tools), manual loop, prompt caching,
-│   │                 #        answer / answer_generic
-│   └── engine.py     # QueryEngine.handle: route → answer
+│   ├── agent.py      # RetrievalAgent: TOOLS (+wiki +semantic_search), manual loop,
+│   │                 #        prompt caching, answer / answer_generic
+│   └── engine.py     # QueryEngine.handle: route → answer (shares one Embedder)
 └── backfill/         # M3: Telegram Desktop export import
     ├── parser.py     # pure result.json parsing → ParsedMessage
     ├── media.py      # copy export files → media/export/YYYY/MM/, sha256
     ├── runner.py     # dedup-at-insert, media attach, BackfillReport
     └── __main__.py   # CLI: python -m family_assistant.backfill
 schema/wiki_guide.md  # M5: Layer 3 — human-edited wiki maintenance rules (in git)
-tests/                # store/FTS, transcription, backfill, captioning, wiki, digest (88 tests)
+tests/                # store/FTS, transcription, backfill, captioning, wiki, digest, embed (104 tests)
 deploy/com.family.tgassistant.plist   # bot (KeepAlive)
 deploy/com.family.tgdigest.plist      # M5: nightly digest (StartCalendarInterval 03:00)
 ```
