@@ -1,14 +1,16 @@
 # Family Telegram Chat Assistant
 
-A Telegram bot that lives in the family group chat, archives everything
-(texts now; voice transcripts, photos and history backfill in later
-milestones) and answers questions about the chat using the Claude API.
+A Telegram bot that lives in the family group chat, archives everything —
+texts, voice/video-circle and video transcripts, photo captions, plus a
+one-time backfill of the chat's full history — and answers questions about it
+using the Claude API.
 
-## Current status — M1
+## Current status — M1–M7 complete
 
 - ✅ Logs all group text messages into SQLite (+ FTS5 trigram search, works for Russian)
 - ✅ Answers when @mentioned or replied to: Haiku intent router → Sonnet agentic
-  retrieval loop (`fts_search`, `get_messages_around`, `recent_window`)
+  retrieval loop (`fts_search`, `get_messages_around`, `recent_window`,
+  `read_wiki_page`, `list_wiki_index`, `semantic_search`)
 - ✅ Generic LLM questions answered directly
 - ✅ M2: voice messages & video circles transcribed locally (faster-whisper,
   $0) and searchable; resumable job queue
@@ -17,7 +19,11 @@ milestones) and answers questions about the chat using the Claude API.
 - ✅ M4: photos captioned (Haiku vision; live worker + resumable Batch-API backfill)
 - ✅ M5: LLM wiki (`wiki/`) maintained by a nightly Haiku digest; the answer
   agent reads it (`list_wiki_index` / `read_wiki_page`)
-- ⏳ M6 semantic search · M7 video & polish
+- ✅ M6: local semantic search (sentence-transformers e5 embeddings, $0) — finds
+  paraphrases FTS misses (`semantic_search` tool)
+- ✅ M7: videos transcribed + keyframe-captioned and searchable; chat commands
+  (`/find`, `/wiki`, `/summary`, `/spend`); router shortcut for obvious queries;
+  per-call token-spend tracking; opt-in weekly chat recap
 
 > **Full scope, architecture, design decisions and per-milestone acceptance
 > criteria live in [ROADMAP.md](ROADMAP.md)** — read that first when resuming
@@ -48,6 +54,16 @@ milestones) and answers questions about the chat using the Claude API.
 
 5. Talk to it: `@your_bot что мы обсуждали вчера?`
 
+## Commands
+
+Anyone in the chat can use these (no @mention needed):
+
+- `/find <query>` — full-text search over the archive
+- `/wiki [topic]` — read a wiki page, or the index if no topic is given
+- `/summary [period]` — recap stitched from the wiki journal (falls back to the agent)
+- `/spend` — this month's estimated Anthropic token cost
+- `/id`, `/stats` — chat id and archive health (message count, newest message time)
+
 ## Backfill chat history (one-time)
 
 The Bot API can't read messages sent before the bot joined. Export the chat
@@ -68,6 +84,18 @@ Partial exports work too: text is always present in the JSON regardless of
 which media types you tick, and you can import in stages — re-running with a
 fuller export (wider date range, more media types) adds the older messages
 and fills in previously missing media files in place.
+
+After importing, three more one-time jobs enrich the backfilled media. All are
+resumable (re-running skips finished work) and process the archive in place:
+
+```bash
+uv run python -m family_assistant.caption_backfill   # photos → Haiku captions (Batch API, 50% off)
+uv run python -m family_assistant.embed_backfill      # all text → semantic-search embeddings (local, $0)
+uv run python -m family_assistant.video_backfill      # videos → transcript + keyframe captions ($0 whisper)
+```
+
+Each takes `--limit N` / `--max-batches N` for a cost-capped trial run; see
+[ROADMAP.md](ROADMAP.md) and `CLAUDE.md` for the full flags.
 
 ## Wiki digest (M5)
 
@@ -143,12 +171,16 @@ uv run pytest
 ## Architecture (short)
 
 ```
-aiogram bot ──► SQLite (WAL) + FTS5 trigram  ◄── Layer 1: raw archive
+                          ┌─ Layer 1: SQLite (WAL) + FTS5 trigram + media/  (raw archive)
+aiogram bot ──► ingest ───┼─ voice/video → whisper · photos → Haiku caption · video → both
+     │                    ├─ Layer 2: wiki/ markdown  (nightly Haiku digest, rebuildable)
+     │                    └─ embeddings (local e5)  → semantic search
      │
-     └─ @mention ──► Haiku router ──► Sonnet tool-use loop ──► answer (RU)
-                       (intent)         fts_search / context / recent
+     └─ @mention ──► Haiku router (or shortcut) ──► Sonnet tool-use loop ──► answer (RU)
+                        (intent)      fts_search / semantic_search / wiki / context / recent
 ```
 
-Cost design: Haiku for routing/bulk, Sonnet only for user-facing answers,
-prompt caching on the agent's frozen system+tools prefix, local processing
-(whisper, embeddings) for the heavy media work in later milestones.
+Cost design: Haiku for routing/bulk (captions, digest), Sonnet only for
+user-facing answers, no Opus; prompt caching on the agent's frozen system+tools
+prefix; local processing (whisper, e5 embeddings) keeps the heavy media work at
+$0. Token spend is tracked per call and reported by `/spend`.
